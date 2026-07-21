@@ -24,7 +24,6 @@ For usage, configuration syntax, and CLI commands, see [Guide.md](Guide.md).
 14. [Configuration System](#14-configuration-system)
 15. [Automation Runner](#15-automation-runner)
 16. [Data Flow](#16-data-flow)
-17. [run.sh — Entry Point](#17-runsh--entry-point)
 18. [Design Philosophy](#18-design-philosophy)
 19. [Development Workflow](#19-development-workflow)
 20. [Contribution Guide](#20-contribution-guide)
@@ -53,14 +52,13 @@ The emulator builds a virtual network using Mininet with Open vSwitch (OVS) swit
 # Install system dependencies
 sudo bash scripts/setup.sh
 
-# Run automated experiment generation
-./run.sh
+# Run a topology interactively (requires root)
+sudo mn -c
+sudo python3 network/topology.py configs/topology_enterprise.yaml --cli
 
-# Run a specific topology interactively
-./run.sh configs/topology_enterprise.yaml
+# Run automated experiment generation (requires root)
+sudo python3 scripts/auto_gen.py --config configs/auto-gen.yaml
 ```
-
-`run.sh` detects its context automatically. If Docker is installed and the image exists, it launches Docker with the bind-mounted dataset directory. Otherwise it runs natively (requires root).
 
 ---
 
@@ -68,7 +66,6 @@ sudo bash scripts/setup.sh
 
 ```
 isp-emulator/
-├── run.sh                        Single entry point (Docker + native)
 ├── config_loader.py              YAML → typed dataclasses
 ├── debug.py                      Coloured console output
 ├── requirements.txt              Python package dependencies
@@ -132,8 +129,6 @@ isp-emulator/
 │   ├── csv/                      Parsed CSV files (permanent)
 │   └── tmp/                      Per-interface staging PCAPNGs (ephemeral)
 │
-├── research_stats/               ML analysis scripts (standalone)
-└── tests/                        Unit tests
 ```
 
 ---
@@ -141,20 +136,14 @@ isp-emulator/
 ## 4. Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  run.sh  (context detection)                    │
-│    Host+Docker → docker run --privileged        │
-│    Container / native root → direct execution   │
-└───────────────┬─────────────────────────────────┘
-                │
-    ┌───────────┴────────────────────────┐
-    │  auto_gen.py (pexpect CLI driver)  │  ← no-arg mode
-    │  Cartesian product × repeat        │
-    │  mn -c → spawn topology.py → CLI  │
-    └───────────┬────────────────────────┘
+    ┌───────────────────────────────────────────────┐
+    │  scripts/auto_gen.py (pexpect CLI driver)     │  ← batch mode
+    │  Cartesian product × repeat                   │
+    │  mn -c → spawn topology.py → CLI             │
+    └───────────┬───────────────────────────────────┘
                 │ spawn subprocess (PTY)
 ┌───────────────▼─────────────────────────────────┐
-│  topology.py (ISPTopology + ISPCli)             │
+│  network/topology.py (ISPTopology + ISPCli)     │  ← interactive mode
 │  Mininet lifecycle + extended CLI commands       │
 └────┬──────┬──────┬──────┬──────┬────────────────┘
      │      │      │      │      │
@@ -528,32 +517,6 @@ capture stop
 
 ---
 
-## 17. run.sh — Entry Point
-
-`run.sh` is the only command users interact with.
-
-**Context detection logic:**
-
-```bash
-_in_container() {
-    [[ -f "/.dockerenv" ]] ||
-        grep -qaE '(docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null
-}
-```
-
-| Context | Detected by | Action |
-|---------|-------------|--------|
-| Host with Docker (image exists) | No `/.dockerenv`, `docker` on PATH, `docker image inspect` succeeds | `exec docker run --privileged --network host -v dataset:dataset isp-emulator "$@"` |
-| Host with Docker (image missing) | Image inspect fails | Print build instruction and exit |
-| Inside container | `/.dockerenv` or cgroup match | Run directly as root |
-| Native Linux, no Docker | No container signal, no Docker | Run directly (requires root) |
-
-The bind mount `-v "$(pwd)/dataset:/opt/isp-emulator/dataset"` is always included when launching Docker. Dataset lands on the host filesystem in real time during the run.
-
-For more detail, see [Guide.md § 2](Guide.md#2-runsh--entry-point).
-
----
-
 ## 18. Design Philosophy
 
 **No global state leakage between experiments.** `auto_gen.py` runs `mn -c` before and after every experiment. `VPNController.turn_on()` always purges wg0 before deploying.
@@ -568,8 +531,6 @@ For more detail, see [Guide.md § 2](Guide.md#2-runsh--entry-point).
 
 **Config is the source of truth.** Every subsystem reads only from `TopologyConfig` and `AllocationResult`. No subsystem re-reads YAML at runtime except the feature selector and CSV parser subprocesses.
 
-**Single entry point.** `run.sh` is the only command users invoke. It handles Docker orchestration, native root execution, and container execution transparently.
-
 ---
 
 ## 19. Development Workflow
@@ -578,14 +539,13 @@ For more detail, see [Guide.md § 2](Guide.md#2-runsh--entry-point).
 # Install dependencies
 sudo bash scripts/setup.sh
 
-# Run tests (no Mininet required)
-pytest tests/
+# Run a topology interactively (requires root)
+sudo mn -c
+sudo python3 network/topology.py configs/topology_enterprise.yaml --cli
 
-# Run a topology interactively
-./run.sh configs/topology_enterprise.yaml
-
-# Run automated batch
-./run.sh
+# Run automated batch (requires root)
+sudo mn -c
+sudo python3 scripts/auto_gen.py --config configs/auto-gen.yaml
 
 # Dry-run: preview experiment plan
 python3 scripts/auto_gen.py --config configs/auto-gen.yaml --dry-run
@@ -598,7 +558,7 @@ sudo mn -c
 
 ## 20. Contribution Guide
 
-**New topology:** copy an existing YAML, modify, test with `./run.sh configs/my_new.yaml`. Ensure `_validate()` passes (raises `ValueError` on structural errors).
+**New topology:** copy an existing YAML, modify, test with `sudo python3 network/topology.py configs/my_new.yaml --cli`. Ensure `_validate()` passes (raises `ValueError` on structural errors).
 
 **New service type:** add deployment function in `services/service_manager.py`. Add type to `ServiceConfig.type` docs in `config_loader.py`.
 
@@ -607,8 +567,6 @@ sudo mn -c
 **New feature column:** see [Guide.md — Developer Recipes](Guide.md#9-developer-recipes).
 
 **Timing protocol changes:** edit `services/database/timing_protocol.py` for logic; edit `config_loader.py` defaults for new YAML keys. Do not modify frozen values in `configs/preregistration.yaml`.
-
-**Tests:** run `pytest tests/` before committing. Tests mock Mininet — no live network required.
 
 ---
 

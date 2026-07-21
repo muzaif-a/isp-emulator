@@ -8,7 +8,7 @@ For architecture and internals, see [README.md](README.md).
 ## Table of Contents
 
 1. [Installation](#1-installation)
-2. [run.sh — Entry Point](#2-runsh--entry-point)
+2. [Running the Emulator](#2-running-the-emulator)
 3. [Topology YAML — Configuration Language](#3-topology-yaml--configuration-language)
    - 3.1 [nodes](#31-nodes)
    - 3.2 [links](#32-links)
@@ -99,73 +99,50 @@ python3 -c "import mininet, yaml, scapy, pexpect; print('OK')"
 
 ---
 
-## 2. run.sh — Entry Point
+## 2. Running the Emulator
 
-`run.sh` is the single command interface. It detects its execution context automatically.
+Both modes require root. Run `sudo mn -c` first to clean up any stale Mininet state from previous sessions.
 
-### Context detection
+### Interactive mode
 
-| Context | Detection | Behaviour |
-|---------|-----------|-----------|
-| Host machine, Docker installed and image exists | No `/.dockerenv`, `docker` on PATH, image found | Launches Docker container with bind-mounted `dataset/` |
-| Inside Docker container | `/.dockerenv` present or `/proc/1/cgroup` matches | Runs directly as root |
-| Native Linux, no Docker | No `/.dockerenv`, no `docker` on PATH | Runs directly (must be root) |
-
-### Usage
-
-```
-./run.sh [topology.yaml]
-```
-
-**No argument — automated experiment generation:**
+Start a single topology and drop into the extended CLI:
 
 ```bash
-./run.sh
+sudo mn -c
+sudo python3 network/topology.py configs/topology_enterprise.yaml --cli
 ```
 
-Runs `scripts/auto_gen.py --config configs/auto-gen.yaml`. Generates a labeled dataset across all combinations defined in `auto-gen.yaml`.
+Builds the Mininet network, deploys services and databases, then opens the CLI where `capture`, `npc`, `vpn`, `inject`, `exfil`, and `apply` commands are available.
 
-**With a topology YAML — interactive topology CLI:**
+Any topology YAML in `configs/` can be used:
 
 ```bash
-./run.sh configs/topology_enterprise.yaml
-./run.sh configs/topology.yaml
-./run.sh configs/topology_dmz_segmented.yaml
+sudo python3 network/topology.py configs/topology.yaml --cli
+sudo python3 network/topology.py configs/topology_dmz_segmented.yaml --cli
 ```
 
-Cleans up any stale Mininet state, then starts `network/topology.py <yaml> --cli`. Drops into the interactive Mininet CLI where capture, NPC, VPN, and exfil commands are available.
+### Batch mode
 
-### When Docker is active
-
-`run.sh` runs the container with these flags automatically:
+Run the automated experiment generator across all combinations in `auto-gen.yaml`:
 
 ```bash
-docker run --rm -it \
-    --privileged \
-    --network host \
-    -v "$(pwd)/dataset:/opt/isp-emulator/dataset" \
-    isp-emulator [topology.yaml]
+sudo mn -c
+sudo python3 scripts/auto_gen.py --config configs/auto-gen.yaml
 ```
 
-Dataset output lands in `./dataset/` on the host immediately as it is written — no copying needed after the container exits.
+Every experiment runs in full isolation (`mn -c` before and after each one).
 
-**If the image does not exist:**
-
-```
-[error] Docker image 'isp-emulator' not found.
-
-Build it first:
-    docker build -t isp-emulator .
-```
-
-### Native Linux (no Docker)
+Dry run — preview the experiment plan without executing:
 
 ```bash
-sudo ./run.sh
-sudo ./run.sh configs/topology_enterprise.yaml
+python3 scripts/auto_gen.py --config configs/auto-gen.yaml --dry-run
 ```
 
-`sudo` is required because Mininet creates Linux network namespaces.
+Resume an interrupted run:
+
+```bash
+sudo python3 scripts/auto_gen.py --config configs/auto-gen.yaml --resume
+```
 
 ---
 
