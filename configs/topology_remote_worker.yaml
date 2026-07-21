@@ -1,0 +1,260 @@
+# topology_remote_worker.yaml
+#
+# Remote worker VPN exfiltration scenario (remote_access VPN mode).
+#
+# Research purpose:
+#   A corporate remote worker (rw1) connects to HQ via WireGuard VPN in
+#   remote_access mode. The worker exfiltrates from the corporate database
+#   (db1) over the encrypted tunnel while HQ internal traffic provides
+#   realistic background noise.
+#
+# Key differences from existing topologies:
+#   - VPN mode is remote_access (individual host client, not LAN gateway).
+#   - Attacker (rw1) is behind a remote home router (r2), not on the ISP backbone.
+#   - HQ has multiple legitimate users (h1) generating NPC background traffic.
+#   - Multiple services at HQ add realistic service complexity.
+#   - The attacker looks indistinguishable from a legitimate remote employee.
+#
+# Network layout:
+#
+#          s1 (ISP backbone)
+#         /      |       \
+#      vpnhub   r1        r2
+#                |         |
+#           HQ LAN      Home LAN
+#          db1,web1,    rw1
+#          ftp1,h1    (remote worker / attacker,
+#                      WireGuard VPN client)
+#
+
+# ── Device classes ─────────────────────────────────────────────────────────────
+device_classes:
+  s1:      isp_backbone_switch
+  vpnhub:  vpn_concentrator
+  r1:      lan_router        # HQ gateway
+  r2:      lan_router        # home/remote gateway
+  h1:      lan_host
+  db1:     datacenter_server
+  web1:    datacenter_server
+  ftp1:    datacenter_server
+  rw1:     lan_host          # remote worker (VPN client / attacker)
+
+attackers:
+  - h1
+  - rw1
+
+# ── ISP backbone and VPN hub ───────────────────────────────────────────────────
+nodes:
+  - name: s1
+    type: switch
+
+  - name: vpnhub
+    type: host
+
+links:
+  - [s1, vpnhub]
+
+# ── LANs ──────────────────────────────────────────────────────────────────────
+lans:
+
+  - name: hq                  # Corporate headquarters
+    gateway: r1
+    isp_switch: s1
+    hosts:
+      - db1                   # victim database — timing protocol enabled
+      - web1                  # intranet web server
+      - ftp1                  # file transfer server
+      - h1                    # internal employee (background NPC traffic)
+
+  - name: remote              # Remote worker's home network
+    gateway: r2
+    isp_switch: s1
+    hosts:
+      - rw1                   # remote worker (VPN client / exfiltrating attacker)
+
+# ── VPN — remote_access mode ──────────────────────────────────────────────────
+# rw1 connects as an individual VPN client (not a LAN gateway peer).
+# vpnhub NAT-masquerades rw1's traffic, hiding its real home LAN IP —
+# exactly how a commercial VPN client behaves.
+vpn:
+  enabled: true
+  mode: remote_access
+  nat: true
+  server:
+    node: vpnhub
+
+vpn_gateways:
+  - vpnhub
+
+vpn_peers:
+  - gateway: vpnhub
+    clients:
+      - rw1         # rw1 is an individual host client, not a gateway
+
+# ── NPC background traffic ─────────────────────────────────────────────────────
+# h1 simulates a typical office employee generating realistic HTTP, DB,
+# DNS, and email traffic throughout the working day.
+npc:
+  hosts:
+    h1: medium
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+  - node: web1
+    type: http
+    port: 8080
+
+  - node: ftp1
+    type: ftp
+    port: 21
+
+  - node: web1
+    type: smtp
+    port: 25
+
+  - node: r1
+    type: ssh
+    port: 22
+
+# ── Corporate database with timing protocol ───────────────────────────────────
+databases:
+  - host: db1
+    name: corporate
+    engine: sqlite
+    api_port: 9090
+    timing_protocol:
+      enabled: true
+      secret_key: remote_worker_key
+      short_delay_ms: 20
+      long_delay_ms: 50
+    tables:
+      - name: employees
+        rows: 150
+        schema:
+          id: integer
+          first_name: first_name
+          last_name: last_name
+          email: email
+          department: department
+          salary: salary
+
+      - name: projects
+        rows: 75
+        schema:
+          id: integer
+          project_name: product
+          department: department
+          budget: price
+          start_date: date
+
+      - name: clients
+        rows: 50
+        schema:
+          id: integer
+          company: text
+          contact_email: email
+          country: country
+          contract_value: salary
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deployment:
+  mode: auto
+
+# ── Firewall ──────────────────────────────────────────────────────────────────
+security:
+  firewall:
+    enabled: false
+    policy: restrictive
+    backend: iptables
+
+# ── Packet capture ────────────────────────────────────────────────────────────
+# Capture on both HQ devices and the remote worker host to observe traffic
+# both before and after VPN encryption.
+capture:
+  automatic: true
+
+  devices:
+    - rw1         # remote worker — captures plaintext side
+    - r2          # home gateway — captures before VPN encryption
+    - vpnhub      # VPN hub — captures tunnel endpoint
+    - r1          # HQ gateway — captures after decryption
+    - db1         # victim database — captures response timing
+    - web1
+    - h1
+
+  cleanup:
+    enabled: true
+
+  parser:
+    enabled: false
+    endpoint:
+      - network/parserapi/csv_parser.py
+    dir:
+      - dataset/csv
+
+  feature_selector:
+    - network/featureselection/feature_selector.py
+
+  feature_selection:
+    DEVICE:            network/featureselectionapi.py:get_device
+    INTERFACE:         network/featureselectionapi.py:get_interface
+    FRAME_NO:          network/featureselectionapi.py:get_frame_number
+    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
+    SOURCE:            network/featureselectionapi.py:get_source
+    DESTINATION:       network/featureselectionapi.py:get_destination
+    PROTOCOL:          network/featureselectionapi.py:get_protocol
+    LENGTH:            network/featureselectionapi.py:get_length
+    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
+    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
+    TOS:               network/featureselectionapi.py:get_tos
+    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
+    TTL:               network/featureselectionapi.py:get_ttl
+    INFO:              network/featureselectionapi.py:get_info
+
+# ── Network settings ──────────────────────────────────────────────────────────
+settings:
+  isp_base_network: "10.0.0.0/8"
+  lan_base_network: "192.168.0.0/16"
+  vpn_base_network: "172.16.0.0/12"
+  vpn_port: 51820
+  log_level: "INFO"
+
+# ── Traffic control ───────────────────────────────────────────────────────────
+# s1-eth0 → vpnhub, s1-eth1 → r1 (hq), s1-eth2 → r2 (remote)
+# lan_sw_hq → lsh1, lan_sw_remote → lsr1
+traffic_control:
+  s1-eth0:     {area: man}
+  s1-eth1:     {area: man}
+  s1-eth2:     {area: man}
+  vpnhub-eth0: {area: man}
+  r1-eth0:     {area: man}
+  r1-eth1:     {area: lan}
+  r2-eth0:     {area: man}
+  r2-eth1:     {area: lan}
+  db1-eth0:    {area: lan}
+  web1-eth0:   {area: lan}
+  ftp1-eth0:   {area: lan}
+  h1-eth0:     {area: lan}
+  rw1-eth0:    {area: lan}
+
+  links:
+    - interfaces: [s1-eth0, vpnhub-eth0]
+      medium: fiber
+    - interfaces: [s1-eth1, r1-eth0]
+      medium: fiber
+    - interfaces: [s1-eth2, r2-eth0]
+      medium: fiber
+    - interfaces: [r1-eth1, lsh1-eth0]
+      medium: fiber
+    - interfaces: [r2-eth1, lsr1-eth0]
+      medium: copper
+    - interfaces: [lsh1-eth1, db1-eth0]
+      medium: fiber
+    - interfaces: [lsh1-eth2, web1-eth0]
+      medium: fiber
+    - interfaces: [lsh1-eth3, ftp1-eth0]
+      medium: fiber
+    - interfaces: [lsh1-eth4, h1-eth0]
+      medium: copper
+    - interfaces: [lsr1-eth1, rw1-eth0]
+      medium: copper

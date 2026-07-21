@@ -1,0 +1,240 @@
+# topology_insider_threat.yaml
+#
+# Insider threat scenario — attacker on the same LAN as the victim database.
+#
+# Research purpose:
+#   Tests watermark detectability at the absolute minimum hop count: one LAN switch
+#   separates attacker (h1) from victim (db1). No VPN tunnel, no inter-LAN routing.
+#   The firewall is enabled but does not protect within-LAN traffic — this is realistic
+#   since iptables rules apply at the router (r1), and LAN traffic bypasses r1.
+#
+# Key differences from existing topologies:
+#   - No VPN.
+#   - Attacker and victim share a single LAN.
+#   - Heavy NPC from two other users (h2, h3) masks the exfiltration traffic.
+#   - Restrictive firewall illustrates that perimeter security fails for insider threats.
+#
+# Network layout:
+#
+#          s1 (ISP backbone)
+#          |
+#          r1 (LAN gateway)
+#          |
+#      lan_sw_corp
+#     /    |    |    \    \
+#    h1   h2   h3  db1  web1
+#  (atk)(usr)(usr)(vic)(web)
+#
+
+# ── Device classes ─────────────────────────────────────────────────────────────
+device_classes:
+  s1:     isp_backbone_switch
+  vpnhub: vpn_concentrator
+  r1:     lan_router
+  h1:     lan_host
+  h2:     lan_host
+  h3:     lan_host
+  db1:    datacenter_server
+  web1:   datacenter_server
+
+attackers:
+  - h1
+  - h2
+
+# ── ISP backbone ───────────────────────────────────────────────────────────────
+nodes:
+  - name: s1
+    type: switch
+
+  - name: vpnhub
+    type: host
+
+links:
+  - [s1, vpnhub]
+
+# ── VPN ───────────────────────────────────────────────────────────────────────
+# Disabled by default — insiders already on LAN. Enable via CLI 'vpn on'
+# to model a scenario where the attacker also tunnels in from outside.
+vpn:
+  enabled: false
+  mode: hybrid
+  nat: true
+  server:
+    node: vpnhub
+  peers:               # router VPN — r1 gateway tunnel
+    - r1
+  clients:             # direct host VPN — insider uses personal VPN
+    - h1
+    - h2
+
+vpn_gateways:
+  - vpnhub
+
+vpn_peers:
+  - gateway: vpnhub
+    clients:
+      - r1
+      - h1            # direct attacker VPN client
+      - h2            # direct attacker VPN client
+
+# ── LAN (all nodes on one segment) ────────────────────────────────────────────
+lans:
+  - name: corp
+    gateway: r1
+    isp_switch: s1
+    hosts:
+      - h1        # insider attacker
+      - h2        # insider attacker
+      - h3        # legitimate user (generates background traffic)
+      - db1       # victim database server
+      - web1      # web server
+
+# ── NPC background traffic ─────────────────────────────────────────────────────
+# h2 and h3 generate heavy background traffic to mask the exfiltration.
+npc:
+  hosts:
+    h2: high
+    h3: high
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+  - node: web1
+    type: http
+    port: 8080
+
+  - node: web1
+    type: smtp
+    port: 25
+
+# ── Victim database with timing protocol ──────────────────────────────────────
+databases:
+  - host: db1
+    name: corpdata
+    engine: sqlite
+    api_port: 9090
+    timing_protocol:
+      enabled: true
+      secret_key: insider_secret
+      short_delay_ms: 20
+      long_delay_ms: 50
+    tables:
+      - name: employees
+        rows: 200
+        schema:
+          id: integer
+          first_name: first_name
+          last_name: last_name
+          email: email
+          department: department
+          salary: salary
+
+      - name: contracts
+        rows: 100
+        schema:
+          id: integer
+          employee_id: integer
+          contract_type: text
+          start_date: date
+          salary: salary
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deployment:
+  mode: auto
+
+# ── Firewall (restrictive — realistic insider threat failure mode) ─────────────
+# Rules apply at r1 (the LAN router). Traffic between hosts on the same LAN
+# switch does NOT pass through r1, so the firewall does not block h1→db1 traffic.
+# This demonstrates that perimeter firewalls fail to prevent insider threats.
+security:
+  firewall:
+    enabled: true
+    policy: restrictive
+    backend: iptables
+
+# ── Packet capture ────────────────────────────────────────────────────────────
+# Capture on all LAN hosts and the gateway router to observe the full traffic
+# picture including background noise from h2 and h3.
+capture:
+  automatic: true
+
+  devices:
+    - h1
+    - h2
+    - h3
+    - db1
+    - web1
+    - r1
+    - vpnhub
+    - s1
+
+  cleanup:
+    enabled: true
+
+  parser:
+    enabled: false
+    endpoint:
+      - network/parserapi/csv_parser.py
+    dir:
+      - dataset/csv
+
+  feature_selector:
+    - network/featureselection/feature_selector.py
+
+  feature_selection:
+    DEVICE:            network/featureselectionapi.py:get_device
+    INTERFACE:         network/featureselectionapi.py:get_interface
+    FRAME_NO:          network/featureselectionapi.py:get_frame_number
+    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
+    SOURCE:            network/featureselectionapi.py:get_source
+    DESTINATION:       network/featureselectionapi.py:get_destination
+    PROTOCOL:          network/featureselectionapi.py:get_protocol
+    LENGTH:            network/featureselectionapi.py:get_length
+    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
+    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
+    TOS:               network/featureselectionapi.py:get_tos
+    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
+    TTL:               network/featureselectionapi.py:get_ttl
+    INFO:              network/featureselectionapi.py:get_info
+
+# ── Network settings ──────────────────────────────────────────────────────────
+settings:
+  isp_base_network: "10.0.0.0/8"
+  lan_base_network: "192.168.0.0/16"
+  vpn_base_network: "172.16.0.0/12"
+  vpn_port: 51820
+  log_level: "INFO"
+
+# ── Traffic control ───────────────────────────────────────────────────────────
+# s1-eth0 → vpnhub  (declared link)
+# s1-eth1 → r1      (lans expansion)
+# r1-eth0 → s1, r1-eth1 → lan_sw_corp (alias lsc1)
+# lsc1-eth0 → r1, lsc1-eth1..5 → h1,h2,h3,db1,web1
+traffic_control:
+  s1-eth0:     {area: man}
+  s1-eth1:     {area: man}
+  vpnhub-eth0: {area: man}
+  r1-eth0:     {area: man}
+  r1-eth1:     {area: lan}
+  h1-eth0:     {area: lan}
+  h2-eth0:     {area: lan}
+  h3-eth0:     {area: lan}
+  db1-eth0:    {area: lan}
+  web1-eth0:   {area: lan}
+
+  links:
+    - interfaces: [s1-eth0, vpnhub-eth0]
+      medium: fiber
+    - interfaces: [s1-eth1, r1-eth0]
+      medium: copper
+    - interfaces: [r1-eth1, lsc1-eth0]
+      medium: copper
+    - interfaces: [lsc1-eth1, h1-eth0]
+      medium: copper
+    - interfaces: [lsc1-eth2, h2-eth0]
+      medium: copper
+    - interfaces: [lsc1-eth3, h3-eth0]
+      medium: copper
+    - interfaces: [lsc1-eth4, db1-eth0]
+      medium: copper
+    - interfaces: [lsc1-eth5, web1-eth0]
+      medium: copper

@@ -1,0 +1,6 @@
+PyYAML>=6.0
+networkx>=3.0
+mininet>=2.3.0
+pexpect>=4.8
+pytest>=7.0
+pytest-timeout>=2.0

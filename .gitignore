@@ -1,0 +1,30 @@
+
+# Claude Code local files
+.claude/
+.agents/
+skills-lock.json
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+research_stats/
+document/
+tests/*
+debug.py
+run.sh
+requirements-lock.txt
+
+# Generated datasets
+dataset/pcapng/*
+!dataset/pcapng/.gitkeep
+
+dataset/csv/*
+!dataset/csv/.gitkeep
+
+dataset/tmp/*
+!dataset/tmp/.gitkeep
+
+# Generated metadata
+dataset/network_profile.json
+dataset/schema.json

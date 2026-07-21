@@ -1,0 +1,342 @@
+# Enterprise ISP Topology — Phase 3
+#
+# Network layout:
+#
+#          ISP backbone (s1)
+#    /      /      |      \      \
+#  r1      r2     r3     r4   vpnhub
+#  |        |      |      |
+# office  dc    branch   lab
+# h1,h2  web1  h4,h5  lab1,lab2,lab3
+#        db1
+#        ftp1
+#        dns1
+#
+# WireGuard VPN: vpnhub is the hub; r1–r4 are spokes.
+
+# ── Device classes (seed_generator tc profile) ─────────────────────────────
+device_classes:
+  s1:    isp_backbone_switch
+  vpnhub: vpn_concentrator
+  r1:    lan_router
+  r2:    lan_router
+  r3:    lan_router
+  r4:    lan_router
+  h1:    lan_host
+  h2:    lan_host
+  h4:    lan_host
+  h5:    lan_host
+  lab1:  lan_host
+  lab2:  lan_host
+  lab3:  lan_host
+  web1:  datacenter_server
+  db1:   datacenter_server
+  ftp1:  datacenter_server
+  dns1:  datacenter_server
+
+# ── VPN global settings ────────────────────────────────────────────────────
+# New-style VPN config: server + peers declared here.
+# This auto-populates vpn_gateways and vpn_peers — no need to repeat them below.
+vpn:
+  enabled: false
+  mode: hybrid           # site_to_site | remote_access | hybrid
+  nat: true              # MASQUERADE VPN client traffic — hides client IPs at gateway
+  server:
+    node: vpnhub
+  peers:                 # gateway-level peers (router VPN — whole LAN tunnels)
+    - r1
+    - r2
+    - r3
+    - r4
+  clients:               # direct host VPN clients (personal VPN — bypass router)
+    - h2
+    - h4
+
+attackers:
+  - h2
+  - h4
+
+# ── ISP infrastructure ─────────────────────────────────────────────────────
+nodes:
+  - name: s1
+    type: switch
+
+  - name: vpnhub
+    type: host
+
+links:
+  - [s1, vpnhub]
+
+# ── LANs (auto-creates routers, LAN switches, hosts, and links) ────────────
+lans:
+
+  - name: office
+    gateway: r1
+    isp_switch: s1
+    hosts:
+      - h1
+      - h2
+
+  - name: datacenter
+    gateway: r2
+    isp_switch: s1
+    hosts:
+      - web1
+      - db1
+      - ftp1
+      - dns1          # DNS server for the enterprise
+
+  - name: branch
+    gateway: r3
+    isp_switch: s1
+    hosts:
+      - h4
+      - h5
+
+  - name: lab           # New LAN — added in Phase 3
+    gateway: r4
+    isp_switch: s1
+    hosts:
+      - lab1
+      - lab2
+      - lab3
+
+# ── NPC background traffic hosts ──────────────────────────────────────────
+npc:
+  hosts:
+    h2:   high
+    h4:   medium
+    h5:   medium
+    lab1: low
+    lab2: low
+    lab3: low
+
+# ── WireGuard VPN ──────────────────────────────────────────────────────────
+vpn_gateways:
+  - vpnhub
+
+vpn_peers:
+  - gateway: vpnhub
+    clients:
+      - r1
+      - r2
+      - r3
+      - r4            # Lab LAN gateway added as VPN client
+      - h2            # direct attacker VPN client (personal VPN)
+      - h4            # direct attacker VPN client (personal VPN)
+
+
+# ── Services (auto-deployed in 'auto' mode) ────────────────────────────────
+# Uses 'node:' key (new form) — 'host:' also accepted for backward compat.
+services:
+
+  - node: web1
+    type: http
+    port: 8080
+
+  - node: ftp1
+    type: ftp
+    port: 21
+
+  - node: web1
+    type: smtp
+    port: 25
+
+  - node: dns1
+    type: dns
+    port: 53
+    options:
+      reply_ip: "10.0.0.1"   # DNS always resolves to ISP (demo)
+
+  - node: r1
+    type: ssh
+    port: 22
+
+  - node: h1
+    type: echo
+    port: 7
+    options:
+      proto: tcp
+
+# ── SQLite database with auto-generated data and CRUD REST API ───────────
+databases:
+  - host: db1
+    name: company
+    engine: sqlite
+    api_port: 9090 
+    timing_protocol:
+      enabled: true
+      secret_key: example_key
+      short_delay_ms: 20    # bit=0 inter-packet delay — change for Tor/ISP modes
+      long_delay_ms: 50     # bit=1 inter-packet delay — must satisfy: long - short >> max_jitter
+    tables:
+      - name: employees
+        rows: 50
+        schema:
+          id: integer
+          first_name: first_name
+          last_name: last_name
+          email: email
+          department: department
+          salary: salary
+
+      - name: products
+        rows: 25
+        schema:
+          id: integer
+          product_name: product
+          category: category
+          price: price
+
+# ── Deployment mode ─────────────────────────────────────────────────────────
+deployment:
+  mode: auto    # auto | manual | hybrid
+
+# ── Optional firewall (disabled by default) ─────────────────────────────────
+security:
+  firewall:
+    enabled: false
+    policy: restrictive
+    backend: iptables
+
+# ── Optional manual route overrides (applied after auto-routing) ─────────────
+# Remove the '#' below to activate. Auto-routing handles everything by default.
+#routes:
+#  - node: r1
+#    destination: 192.168.99.0/24
+#    via: 10.0.0.99
+#  - node: r2
+#    destination: 0.0.0.0/0
+#    via: 10.0.0.1
+
+# ── Packet capture configuration ─────────────────────────────────────────────
+capture:
+  automatic: true
+
+  devices:
+    - r1
+    - r2
+    - r3
+    - r4
+    - h1
+    - h2
+    - h4
+    - h5
+    - lab1
+    - lab2
+    - lab3
+    - db1
+    - web1
+    - ftp1
+    - dns1
+    - vpnhub
+    - s1
+
+  cleanup:
+    enabled: true
+
+  parser:
+    enabled: false
+    endpoint:
+      - network/parserapi/csv_parser.py
+    dir:
+      - dataset/csv
+
+  feature_selector:
+    - network/featureselection/feature_selector.py
+
+  feature_selection:
+    DEVICE:            network/featureselectionapi.py:get_device
+    INTERFACE:         network/featureselectionapi.py:get_interface
+    FRAME_NO:          network/featureselectionapi.py:get_frame_number
+    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
+    SOURCE:            network/featureselectionapi.py:get_source
+    DESTINATION:       network/featureselectionapi.py:get_destination
+    PROTOCOL:          network/featureselectionapi.py:get_protocol
+    LENGTH:            network/featureselectionapi.py:get_length
+    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
+    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
+    TOS:               network/featureselectionapi.py:get_tos
+    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
+    TTL:               network/featureselectionapi.py:get_ttl
+    INFO:              network/featureselectionapi.py:get_info
+
+
+
+
+# ── Base network settings ────────────────────────────────────────────────────
+settings:
+  isp_base_network: "10.0.0.0/8"
+  lan_base_network: "192.168.0.0/16"
+  vpn_base_network: "172.16.0.0/12"
+  vpn_port: 51820
+  log_level: "INFO"
+
+traffic_control:
+  s1-eth0:     {area: man}
+  s1-eth1:     {area: man}
+  s1-eth2:     {area: man}
+  s1-eth3:     {area: man}
+  s1-eth4:     {area: man}
+  vpnhub-eth0: {area: man}
+  r1-eth0:     {area: man}
+  r1-eth1:     {area: lan}
+  r2-eth0:     {area: man}
+  r2-eth1:     {area: lan}
+  r3-eth0:     {area: man}
+  r3-eth1:     {area: lan}
+  r4-eth0:     {area: man}
+  r4-eth1:     {area: lan}
+  h1-eth0:     {area: lan}
+  h2-eth0:     {area: lan}
+  h4-eth0:     {area: lan}
+  h5-eth0:     {area: lan}
+  lab1-eth0:   {area: lan}
+  lab2-eth0:   {area: lan}
+  lab3-eth0:   {area: lan}
+  web1-eth0:   {area: lan}
+  db1-eth0:    {area: lan}
+  ftp1-eth0:   {area: lan}
+  dns1-eth0:   {area: lan}
+
+  links:
+    - interfaces: [s1-eth0, vpnhub-eth0]
+      medium: fiber
+    - interfaces: [s1-eth1, r1-eth0]
+      medium: fiber
+    - interfaces: [r1-eth1, lso1-eth0]
+      medium: copper
+    - interfaces: [s1-eth2, r2-eth0]
+      medium: fiber
+    - interfaces: [r2-eth1, lsd1-eth0]
+      medium: fiber
+    - interfaces: [s1-eth3, r3-eth0]
+      medium: fiber
+    - interfaces: [r3-eth1, lsb1-eth0]
+      medium: copper
+    - interfaces: [s1-eth4, r4-eth0]
+      medium: fiber
+    - interfaces: [r4-eth1, lsl1-eth0]
+      medium: fiber
+    - interfaces: [h1-eth0, lso1-eth1]
+      medium: copper
+    - interfaces: [h2-eth0, lso1-eth2]
+      medium: copper
+    - interfaces: [web1-eth0, lsd1-eth1]
+      medium: fiber
+    - interfaces: [db1-eth0, lsd1-eth2]
+      medium: fiber
+    - interfaces: [ftp1-eth0, lsd1-eth3]
+      medium: fiber
+    - interfaces: [dns1-eth0, lsd1-eth4]
+      medium: fiber
+    - interfaces: [h4-eth0, lsb1-eth1]
+      medium: copper
+    - interfaces: [h5-eth0, lsb1-eth2]
+      medium: copper
+    - interfaces: [lab1-eth0, lsl1-eth1]
+      medium: fiber
+    - interfaces: [lab2-eth0, lsl1-eth2]
+      medium: fiber
+    - interfaces: [lab3-eth0, lsl1-eth3]
+      medium: fiber

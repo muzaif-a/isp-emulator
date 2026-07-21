@@ -1,0 +1,73 @@
+# CYBER-PULSE Preregistration Configuration
+# Frozen: 2026-07-18 — before full batch data collection
+# DO NOT MODIFY after this date. See research_stats/reports/PREREGISTRATION.txt.
+#
+# This file contains RUNTIME VALUES only — values that code actually reads.
+# Success criteria, power targets, hypotheses, and stopping rules live in
+# research_stats/reports/PREREGISTRATION.txt (human-readable documentation).
+#
+# Source of values:
+#   threshold_ms: histogram valley from research_stats/reports/eda_results.json (n=15 pilot)
+#   tolerances:   3-sigma from empirical per-mode standard deviations
+#   cnn.*:        matches hard-coded constants in research_stats/cnn_detector.py
+
+experiment:
+  id: preregistration-v1
+  freeze_date: "2026-07-18"
+  frozen: true
+
+thresholds:
+  bit_classification_ms: 26.5        # histogram valley between 20ms and 50ms modes
+  bit_0_tolerance_3sigma_ms: 4.143   # empirical 3σ at 20ms mode
+  bit_1_tolerance_3sigma_ms: 9.042   # empirical 3σ at 50ms mode
+  minimum_signal_integrity_pct: 80.0 # minimum acceptable; observed 88.9% in pilot
+  neural_confidence_minimum: 0.90    # Neyman-Pearson α=0.05 (forensic)
+
+feature_extraction:
+  length_filter_bytes: 100    # removes TCP ACKs (54-66B); restores accuracy from ~40% to 94-100%
+  protocol: TCP
+  source_port: 9090
+  device: db1                 # embed point; do NOT use r1/h1/r2 for training labels
+
+cnn:
+  input_length: 64            # 95th percentile of real IPD sequence lengths
+  clip_ms: 100.0              # IPDs clipped to [0, clip_ms] before normalizing
+  normalization: divide_by_clip
+  padding: left_zero
+  architecture:
+    - {type: Conv1D, filters: 32, kernel: 3, activation: relu, padding: same, l2: 1e-4}
+    - {type: BatchNormalization}
+    - {type: MaxPooling1D, pool: 2}
+    - {type: Conv1D, filters: 64, kernel: 5, activation: relu, padding: same, l2: 1e-4}
+    - {type: BatchNormalization}
+    - {type: GlobalAveragePooling1D}
+    - {type: Dense, units: 64, activation: relu, l2: 1e-4}
+    - {type: Dropout, rate: 0.5}
+    - {type: Dense, units: 1, activation: sigmoid}
+  training:
+    optimizer: adam
+    learning_rate: 1.0e-3
+    batch_size: 16
+    epochs: 200
+    val_frac: 0.2
+    early_stopping_monitor: val_auc
+    early_stopping_patience: 20
+    early_stopping_mode: max
+    reduce_lr_monitor: val_loss
+    reduce_lr_factor: 0.5
+    reduce_lr_patience: 10
+    class_balancing: inverse_frequency_weights
+    seed: 42
+
+evaluation:
+  primary: LOCO_NPC
+  train_conditions: [none, low, medium]
+  test_conditions: [high]
+  secondary:
+    - LOCO_VPN       # train: site_to_site, test: remote_access
+    - LOCO_Attacker  # train: h1, test: h4
+    - random_split   # 25% test, stratified by label
+  split_level: session   # NEVER split windows from same session across train/test
+  metrics: [F1, Precision, Recall, AUC, PR_AUC, FPR, FNR, MCC, Cohen_Kappa]
+  bootstrap_ci: 95
+  significance_alpha: 0.05

@@ -1,0 +1,294 @@
+# topology_three_site.yaml
+#
+# Three-site VPN network — multi-origin attribution scenario.
+#
+# Research purpose:
+#   Three branch offices connected via site-to-site WireGuard VPN. The victim
+#   database is at HQ (r1). Branch A (r2) and Branch B (r3) both contain
+#   potential attackers. Background NPC traffic runs at both branches.
+#
+#   This topology generates a labelled dataset where the same watermark key is
+#   used regardless of which branch the attacker originates from, allowing
+#   research into whether the watermark alone can be used for attribution
+#   (i.e., does network path affect the watermark signature in a detectable way?).
+#
+# Key differences from existing topologies:
+#   - Three-site (vs two-site basic or four-site enterprise).
+#   - Two simultaneous potential attacker origins — experiments can alternate
+#     between h1 (Branch A) and h3 (Branch B) as the attacker host.
+#   - HQ carries all critical services (database, web, DNS).
+#   - Heavy NPC at both branches simulates realistic distributed workforce load.
+#
+# Network layout:
+#
+#          s1 (ISP backbone)
+#         /    |     |    \
+#      vpnhub  r1   r2   r3
+#               |    |    |
+#             HQ    BranchA  BranchB
+#         db1,web1  h1,h2    h3,h4
+#         dns1     (atk A)  (atk B)
+#
+
+# ── Device classes ─────────────────────────────────────────────────────────────
+device_classes:
+  s1:      isp_backbone_switch
+  vpnhub:  vpn_concentrator
+  r1:      lan_router    # HQ
+  r2:      lan_router    # Branch A
+  r3:      lan_router    # Branch B
+  h1:      lan_host
+  h2:      lan_host
+  h3:      lan_host
+  h4:      lan_host
+  db1:     datacenter_server
+  web1:    datacenter_server
+  dns1:    datacenter_server
+
+attackers:
+  - h1    # Branch A attacker
+  - h3    # Branch B attacker
+
+# ── ISP backbone and VPN hub ───────────────────────────────────────────────────
+nodes:
+  - name: s1
+    type: switch
+
+  - name: vpnhub
+    type: host
+
+links:
+  - [s1, vpnhub]
+
+# ── LANs ──────────────────────────────────────────────────────────────────────
+lans:
+
+  - name: hq              # Headquarters — holds all shared services
+    gateway: r1
+    isp_switch: s1
+    hosts:
+      - db1               # victim database (timing protocol enabled)
+      - web1              # internal web server
+      - dns1              # shared corporate DNS
+
+  - name: brancha         # Branch office A — potential attacker origin
+    gateway: r2
+    isp_switch: s1
+    hosts:
+      - h1                # attacker candidate A
+      - h2                # legitimate Branch A employee (NPC)
+
+  - name: branchb         # Branch office B — alternate attacker origin
+    gateway: r3
+    isp_switch: s1
+    hosts:
+      - h3                # attacker candidate B
+      - h4                # legitimate Branch B employee (NPC)
+
+# ── VPN — site_to_site ────────────────────────────────────────────────────────
+# All three LAN gateways participate as VPN peers.
+# Each branch gets VPN-encrypted routes to HQ and to the other branch.
+vpn:
+  enabled: false
+  mode: hybrid
+  nat: true
+  server:
+    node: vpnhub
+  peers:               # router VPN — gateway-level tunnels
+    - r1
+    - r2
+    - r3
+  clients:             # direct host VPN — personal/direct tunnel to vpnhub
+    - h1
+    - h3
+
+vpn_gateways:
+  - vpnhub
+
+vpn_peers:
+  - gateway: vpnhub
+    clients:
+      - r1
+      - r2
+      - r3
+      - h1            # direct attacker VPN client
+      - h3            # direct attacker VPN client
+
+# ── NPC background traffic ─────────────────────────────────────────────────────
+# High background load at both branches to mask attacker traffic.
+# HQ does not run NPC — server hosts are not modeled as interactive users.
+npc:
+  hosts:
+    h2: high
+    h4: high
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+  - node: web1
+    type: http
+    port: 8080
+
+  - node: web1
+    type: smtp
+    port: 25
+
+  - node: dns1
+    type: dns
+    port: 53
+    options:
+      reply_ip: "10.0.0.1"
+
+  - node: r1
+    type: ssh
+    port: 22
+
+# ── Victim database with timing protocol ──────────────────────────────────────
+databases:
+  - host: db1
+    name: corporate
+    engine: sqlite
+    api_port: 9090
+    timing_protocol:
+      enabled: true
+      secret_key: threesite_key
+      short_delay_ms: 20
+      long_delay_ms: 50
+    tables:
+      - name: employees
+        rows: 300
+        schema:
+          id: integer
+          first_name: first_name
+          last_name: last_name
+          email: email
+          department: department
+          salary: salary
+
+      - name: customers
+        rows: 150
+        schema:
+          id: integer
+          company: text
+          contact: first_name
+          email: email
+          country: country
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deployment:
+  mode: auto
+
+# ── Firewall ──────────────────────────────────────────────────────────────────
+security:
+  firewall:
+    enabled: false
+    policy: restrictive
+    backend: iptables
+
+# ── Packet capture ────────────────────────────────────────────────────────────
+# Capture across all sites and the VPN hub to observe traffic from either
+# attacker branch and attribute it via timing watermark analysis.
+capture:
+  automatic: true
+
+  devices:
+    - h1          # Branch A potential attacker
+    - h2          # Branch A background user
+    - h3          # Branch B potential attacker
+    - h4          # Branch B background user
+    - r2          # Branch A gateway
+    - r3          # Branch B gateway
+    - vpnhub      # VPN concentration point
+    - r1          # HQ gateway
+    - db1         # victim database
+    - web1
+    - dns1
+
+  cleanup:
+    enabled: true
+
+  parser:
+    enabled: false
+    endpoint:
+      - network/parserapi/csv_parser.py
+    dir:
+      - dataset/csv
+
+  feature_selector:
+    - network/featureselection/feature_selector.py
+
+  feature_selection:
+    DEVICE:            network/featureselectionapi.py:get_device
+    INTERFACE:         network/featureselectionapi.py:get_interface
+    FRAME_NO:          network/featureselectionapi.py:get_frame_number
+    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
+    SOURCE:            network/featureselectionapi.py:get_source
+    DESTINATION:       network/featureselectionapi.py:get_destination
+    PROTOCOL:          network/featureselectionapi.py:get_protocol
+    LENGTH:            network/featureselectionapi.py:get_length
+    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
+    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
+    TOS:               network/featureselectionapi.py:get_tos
+    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
+    TTL:               network/featureselectionapi.py:get_ttl
+    INFO:              network/featureselectionapi.py:get_info
+
+# ── Network settings ──────────────────────────────────────────────────────────
+settings:
+  isp_base_network: "10.0.0.0/8"
+  lan_base_network: "192.168.0.0/16"
+  vpn_base_network: "172.16.0.0/12"
+  vpn_port: 51820
+  log_level: "INFO"
+
+# ── Traffic control ───────────────────────────────────────────────────────────
+# s1-eth0 → vpnhub, s1-eth1 → r1 (hq), s1-eth2 → r2 (brancha), s1-eth3 → r3 (branchb)
+# lan_sw_hq → lsh1, lan_sw_brancha → lsb1, lan_sw_branchb → lsb2
+traffic_control:
+  s1-eth0:     {area: man}
+  s1-eth1:     {area: man}
+  s1-eth2:     {area: man}
+  s1-eth3:     {area: man}
+  vpnhub-eth0: {area: man}
+  r1-eth0:     {area: man}
+  r1-eth1:     {area: lan}
+  r2-eth0:     {area: man}
+  r2-eth1:     {area: lan}
+  r3-eth0:     {area: man}
+  r3-eth1:     {area: lan}
+  db1-eth0:    {area: lan}
+  web1-eth0:   {area: lan}
+  dns1-eth0:   {area: lan}
+  h1-eth0:     {area: lan}
+  h2-eth0:     {area: lan}
+  h3-eth0:     {area: lan}
+  h4-eth0:     {area: lan}
+
+  links:
+    - interfaces: [s1-eth0, vpnhub-eth0]
+      medium: fiber
+    - interfaces: [s1-eth1, r1-eth0]
+      medium: fiber
+    - interfaces: [s1-eth2, r2-eth0]
+      medium: fiber
+    - interfaces: [s1-eth3, r3-eth0]
+      medium: fiber
+    - interfaces: [r1-eth1, lsh1-eth0]
+      medium: fiber
+    - interfaces: [r2-eth1, lsb1-eth0]
+      medium: copper
+    - interfaces: [r3-eth1, lsb2-eth0]
+      medium: copper
+    - interfaces: [lsh1-eth1, db1-eth0]
+      medium: fiber
+    - interfaces: [lsh1-eth2, web1-eth0]
+      medium: fiber
+    - interfaces: [lsh1-eth3, dns1-eth0]
+      medium: fiber
+    - interfaces: [lsb1-eth1, h1-eth0]
+      medium: copper
+    - interfaces: [lsb1-eth2, h2-eth0]
+      medium: copper
+    - interfaces: [lsb2-eth1, h3-eth0]
+      medium: copper
+    - interfaces: [lsb2-eth2, h4-eth0]
+      medium: copper

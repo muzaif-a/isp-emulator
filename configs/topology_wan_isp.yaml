@@ -1,0 +1,273 @@
+# topology_wan_isp.yaml
+#
+# WAN-scale ISP-realistic bandwidth experiment.
+#
+# Research purpose:
+#   Tests watermark survival under ISP-realistic bandwidth constraints.
+#   The existing topologies use virtual Mininet links at 22,000–44,000 Mbps,
+#   where NPC queuing delay is negligible (< 0.006ms). At real ISP speeds
+#   (10–100 Mbps for isp_access, 100–1,000 Mbps for isp_enterprise), queuing
+#   delay at the TBF becomes 1–11ms — enough to introduce significant jitter.
+#
+#   This topology uses isp_access and wan TC area types to bring the emulator
+#   into a regime that matches real ISP infrastructure. Run `apply tc --seed N`
+#   to activate the TC profile before generating dataset sessions.
+#
+# Key differences from existing topologies:
+#   - TC area types: wan/isp_enterprise for backbone, isp_access for LANs.
+#   - device_classes: wan_router for gateways (higher processing latency model).
+#   - Minimal services — focus is on TC accuracy, not service variety.
+#   - Two sites only — keeps the topology simple for TC calibration experiments.
+#
+# Network layout:
+#
+#          s1 (ISP backbone — isp_enterprise area)
+#         /      |       \
+#      vpnhub   r1        r2
+#   (isp_ent)  (wan)     (wan)
+#                |         |
+#           Site A LAN  Site B LAN
+#          (isp_access) (isp_access)
+#           db1, web1   h1, h2
+#           (victim)   (attacker)
+#
+
+# ── Device classes ─────────────────────────────────────────────────────────────
+# wan_router gives higher processing latency bounds than lan_router,
+# matching real ISP CPE (customer-premises equipment) behavior.
+device_classes:
+  s1:      isp_backbone_switch
+  vpnhub:  vpn_concentrator
+  r1:      wan_router          # Site A CPE
+  r2:      wan_router          # Site B CPE
+  db1:     datacenter_server
+  web1:    datacenter_server
+  h1:      lan_host
+  h2:      lan_host
+
+attackers:
+  - h1    # Site B attacker
+
+# ── ISP backbone and VPN hub ───────────────────────────────────────────────────
+nodes:
+  - name: s1
+    type: switch
+
+  - name: vpnhub
+    type: host
+
+links:
+  - [s1, vpnhub]
+
+# ── LANs ──────────────────────────────────────────────────────────────────────
+lans:
+
+  - name: sitea           # Victim site — holds the database
+    gateway: r1
+    isp_switch: s1
+    hosts:
+      - db1               # victim database (timing protocol enabled)
+      - web1              # web server (additional traffic source)
+
+  - name: siteb           # Attacker site
+    gateway: r2
+    isp_switch: s1
+    hosts:
+      - h1                # attacker
+      - h2                # background user (NPC)
+
+# ── VPN — site_to_site ────────────────────────────────────────────────────────
+vpn:
+  enabled: false
+  mode: hybrid
+  nat: true
+  server:
+    node: vpnhub
+  peers:               # router VPN — site-level tunnels
+    - r1
+    - r2
+  clients:             # direct host VPN — attacker bypasses site router
+    - h1
+
+vpn_gateways:
+  - vpnhub
+
+vpn_peers:
+  - gateway: vpnhub
+    clients:
+      - r1
+      - r2
+      - h1            # direct attacker VPN client
+
+# ── NPC background traffic ─────────────────────────────────────────────────────
+# Medium intensity at the attacker site simulates typical user activity while
+# the exfiltration happens. This is the most interesting condition for WAN
+# jitter testing — enough load to cause queuing at ISP speeds, but not so
+# much that the watermark is completely overwhelmed.
+npc:
+  hosts:
+    h2: medium
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+  - node: web1
+    type: http
+    port: 8080
+
+# ── Victim database with timing protocol ──────────────────────────────────────
+databases:
+  - host: db1
+    name: sitedata
+    engine: sqlite
+    api_port: 9090
+    timing_protocol:
+      enabled: true
+      secret_key: wan_isp_key
+      short_delay_ms: 20
+      long_delay_ms: 50
+    tables:
+      - name: records
+        rows: 500
+        schema:
+          id: integer
+          first_name: first_name
+          last_name: last_name
+          email: email
+          department: department
+          salary: salary
+
+      - name: transactions
+        rows: 200
+        schema:
+          id: integer
+          amount: price
+          category: category
+          date: date
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deployment:
+  mode: auto
+
+# ── Firewall ──────────────────────────────────────────────────────────────────
+security:
+  firewall:
+    enabled: false
+    policy: restrictive
+    backend: iptables
+
+# ── Packet capture ────────────────────────────────────────────────────────────
+capture:
+  automatic: true
+
+  devices:
+    - h1          # attacker
+    - h2          # background user
+    - r2          # Site B CPE (WAN-facing)
+    - vpnhub      # VPN hub (encryption boundary)
+    - r1          # Site A CPE (WAN-facing)
+    - db1         # victim database
+    - web1
+
+  cleanup:
+    enabled: true
+
+  parser:
+    enabled: false
+    endpoint:
+      - network/parserapi/csv_parser.py
+    dir:
+      - dataset/csv
+
+  feature_selector:
+    - network/featureselection/feature_selector.py
+
+  feature_selection:
+    DEVICE:            network/featureselectionapi.py:get_device
+    INTERFACE:         network/featureselectionapi.py:get_interface
+    FRAME_NO:          network/featureselectionapi.py:get_frame_number
+    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
+    SOURCE:            network/featureselectionapi.py:get_source
+    DESTINATION:       network/featureselectionapi.py:get_destination
+    PROTOCOL:          network/featureselectionapi.py:get_protocol
+    LENGTH:            network/featureselectionapi.py:get_length
+    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
+    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
+    TOS:               network/featureselectionapi.py:get_tos
+    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
+    TTL:               network/featureselectionapi.py:get_ttl
+    INFO:              network/featureselectionapi.py:get_info
+
+# ── Network settings ──────────────────────────────────────────────────────────
+settings:
+  isp_base_network: "10.0.0.0/8"
+  lan_base_network: "192.168.0.0/16"
+  vpn_base_network: "172.16.0.0/12"
+  vpn_port: 51820
+  log_level: "INFO"
+
+# ── Traffic control — ISP-realistic TC profiles ───────────────────────────────
+# Interface names are derived from the node names and link order above.
+# Run: apply tc --seed 42
+#
+# Backbone (s1) interfaces:
+#   s1-eth0 → vpnhub  (first link declared: [s1, vpnhub])
+#   s1-eth1 → r1      (from lans expansion, sitea)
+#   s1-eth2 → r2      (from lans expansion, siteb)
+#
+# LAN switches created by lans expansion:
+#   lan_sw_sitea → alias lss1   (word initials: l+s+s = "lss", first occurrence)
+#   lan_sw_siteb → alias lss2   (same initials, second occurrence)
+#
+# Router interfaces:
+#   r1-eth0 → s1 (ISP/WAN side),  r1-eth1 → lss1 (LAN side)
+#   r2-eth0 → s1 (ISP/WAN side),  r2-eth1 → lss2 (LAN side)
+traffic_control:
+  # ISP backbone switch interfaces — isp_enterprise area (high bandwidth ISP links)
+  s1-eth0:     {area: isp_enterprise}   # to vpnhub
+  s1-eth1:     {area: isp_enterprise}   # to r1 (Site A)
+  s1-eth2:     {area: isp_enterprise}   # to r2 (Site B)
+
+  # VPN hub
+  vpnhub-eth0: {area: isp_enterprise}
+
+  # WAN router interfaces — ISP-facing side (wan area: lower bandwidth, higher latency)
+  r1-eth0:     {area: wan}              # Site A WAN uplink
+  r2-eth0:     {area: wan}              # Site B WAN uplink
+
+  # WAN router interfaces — LAN-facing side (isp_access: customer premises speeds)
+  r1-eth1:     {area: isp_access}       # Site A LAN downlink
+  r2-eth1:     {area: isp_access}       # Site B LAN downlink
+
+  # LAN switch interfaces (auto-aliased: lss1 = lan_sw_sitea, lss2 = lan_sw_siteb)
+  lss1-eth0:   {area: isp_access}       # lan_sw_sitea → r1
+  lss1-eth1:   {area: isp_access}       # lan_sw_sitea → db1
+  lss1-eth2:   {area: isp_access}       # lan_sw_sitea → web1
+  lss2-eth0:   {area: isp_access}       # lan_sw_siteb → r2
+  lss2-eth1:   {area: isp_access}       # lan_sw_siteb → h1
+  lss2-eth2:   {area: isp_access}       # lan_sw_siteb → h2
+
+  # Host interfaces
+  db1-eth0:    {area: isp_access}
+  web1-eth0:   {area: isp_access}
+  h1-eth0:     {area: isp_access}
+  h2-eth0:     {area: isp_access}
+
+  links:
+    - interfaces: [s1-eth0, vpnhub-eth0]
+      medium: fiber
+    - interfaces: [s1-eth1, r1-eth0]
+      medium: fiber
+    - interfaces: [s1-eth2, r2-eth0]
+      medium: fiber
+    - interfaces: [r1-eth1, lss1-eth0]
+      medium: copper
+    - interfaces: [r2-eth1, lss2-eth0]
+      medium: copper
+    - interfaces: [lss1-eth1, db1-eth0]
+      medium: fiber
+    - interfaces: [lss1-eth2, web1-eth0]
+      medium: fiber
+    - interfaces: [lss2-eth1, h1-eth0]
+      medium: copper
+    - interfaces: [lss2-eth2, h2-eth0]
+      medium: copper

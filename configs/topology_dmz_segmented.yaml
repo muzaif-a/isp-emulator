@@ -1,0 +1,311 @@
+# topology_dmz_segmented.yaml
+#
+# Three-zone security architecture — External → DMZ → Internal.
+#
+# Research purpose:
+#   Models a realistic enterprise security posture with three network zones.
+#   The attacker (h1) is in the External zone and uses site-to-site VPN to reach
+#   the DMZ. From the DMZ, normal IP routing reaches the Internal zone where the
+#   victim database (db1) lives. A restrictive firewall is active across all zones.
+#
+#   This topology tests:
+#   (a) Watermark survival through multi-hop routing: external → ISP → DMZ → ISP → internal.
+#   (b) Whether a restrictive firewall (with allowed port 9090) interferes with
+#       timing-based watermark detection.
+#   (c) Dataset generation in a high-complexity security environment.
+#
+# Key differences from existing topologies:
+#   - Three distinct security zones (external, DMZ, internal).
+#   - Restrictive firewall enabled — all traffic is filtered at each gateway router.
+#   - DMZ contains intermediate services (proxy, DNS) that generate background noise.
+#   - VPN only covers the external→hub segment; DMZ→internal uses ISP routing.
+#   - Static routes demonstrate the manual routing override feature.
+#
+# Network layout:
+#
+#          s1 (ISP backbone)
+#         /    |      |     \
+#      vpnhub  r1    r2     r3
+#              |      |      |
+#          External  DMZ   Internal
+#           h1      proxy1  db1, hr1
+#          (atk)    dns1   (victim)
+#                   h2
+#
+
+# ── Device classes ─────────────────────────────────────────────────────────────
+device_classes:
+  s1:      isp_backbone_switch
+  vpnhub:  vpn_concentrator
+  r1:      lan_router    # external zone gateway
+  r2:      lan_router    # DMZ gateway
+  r3:      lan_router    # internal zone gateway
+  h1:      lan_host      # external attacker
+  h2:      lan_host      # DMZ workstation (generates background traffic)
+  proxy1:  datacenter_server
+  dns1:    datacenter_server
+  db1:     datacenter_server
+  hr1:     datacenter_server
+
+attackers:
+  - h1
+  - h2
+
+# ── ISP backbone and VPN hub ───────────────────────────────────────────────────
+nodes:
+  - name: s1
+    type: switch
+
+  - name: vpnhub
+    type: host
+
+links:
+  - [s1, vpnhub]
+
+# ── LANs ──────────────────────────────────────────────────────────────────────
+lans:
+
+  - name: external        # Untrusted external zone
+    gateway: r1
+    isp_switch: s1
+    hosts:
+      - h1                # attacker — uses VPN to tunnel into the network
+
+  - name: dmz             # DMZ — partially trusted intermediate zone
+    gateway: r2
+    isp_switch: s1
+    hosts:
+      - proxy1            # HTTP reverse proxy (intermediate service)
+      - dns1              # DNS resolver (shared by all zones)
+      - h2                # DMZ workstation (background traffic source)
+
+  - name: internal        # Internal zone — protected corporate resources
+    gateway: r3
+    isp_switch: s1
+    hosts:
+      - db1               # victim database (timing protocol enabled)
+      - hr1               # HR system (additional internal service)
+
+# ── VPN — site_to_site ────────────────────────────────────────────────────────
+# VPN connects only the external gateway (r1) to vpnhub.
+# The DMZ (r2) and Internal (r3) are reachable via ISP backbone routing.
+# This models a setup where only external partners use VPN; internal zones trust
+# the corporate backbone.
+vpn:
+  enabled: false
+  mode: hybrid
+  nat: true
+  server:
+    node: vpnhub
+  peers:               # router VPN — external gateway tunnel
+    - r1
+  clients:             # direct host VPN — attacker with personal VPN
+    - h1
+
+vpn_gateways:
+  - vpnhub
+
+vpn_peers:
+  - gateway: vpnhub
+    clients:
+      - r1
+      - h1            # direct attacker VPN client
+
+# ── NPC background traffic ─────────────────────────────────────────────────────
+# DMZ workstation (h2) generates background traffic simulating DMZ activity.
+# Low intensity to avoid overwhelming the DMZ and masking the attack signal.
+npc:
+  hosts:
+    h2: low
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+  # DMZ services (proxy and DNS serve all zones via routing)
+  - node: proxy1
+    type: http
+    port: 8080
+
+  - node: dns1
+    type: dns
+    port: 53
+    options:
+      reply_ip: "10.0.0.1"
+
+  # Internal HR system (simulates secondary internal service)
+  - node: hr1
+    type: http
+    port: 8081
+
+  # SSH on DMZ gateway for administrative access
+  - node: r2
+    type: ssh
+    port: 22
+
+# ── Victim database with timing protocol ──────────────────────────────────────
+# db1 is in the internal zone. The attacker reaches it via:
+#   h1 → r1 (VPN) → vpnhub → ISP backbone → r2 (DMZ) → ISP backbone → r3 → db1
+# (routing through DMZ is automatic via inter-LAN routes on the ISP backbone)
+databases:
+  - host: db1
+    name: internaldb
+    engine: sqlite
+    api_port: 9090
+    timing_protocol:
+      enabled: true
+      secret_key: dmz_segmented_key
+      short_delay_ms: 20
+      long_delay_ms: 50
+    tables:
+      - name: personnel
+        rows: 250
+        schema:
+          id: integer
+          first_name: first_name
+          last_name: last_name
+          email: email
+          department: department
+          salary: salary
+          address: address
+
+      - name: payroll
+        rows: 250
+        schema:
+          id: integer
+          employee_id: integer
+          amount: salary
+          pay_date: date
+          department: department
+
+  - host: hr1
+    name: hrdata
+    engine: sqlite
+    api_port: 8090
+    timing_protocol:
+      enabled: false         # HR system — not watermarked (baseline traffic)
+    tables:
+      - name: leave_records
+        rows: 100
+        schema:
+          id: integer
+          employee_id: integer
+          leave_type: text
+          start_date: date
+          days: integer
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deployment:
+  mode: auto
+
+# ── Firewall — restrictive across all zones ───────────────────────────────────
+# Applies iptables rules to all gateway routers (r1, r2, r3).
+# Restrictive policy blocks unexpected traffic; port 9090 (db1 API) is
+# allowed because it is in the databases config. Port 8090 (hr1 API) is
+# allowed because hr1 declares it.
+security:
+  firewall:
+    enabled: true
+    policy: restrictive
+    backend: iptables
+
+# ── Packet capture ────────────────────────────────────────────────────────────
+# Full capture across all zones: attacker side, DMZ transit, and internal target.
+capture:
+  automatic: true
+
+  devices:
+    - h1          # external attacker
+    - r1          # external gateway (pre-VPN traffic)
+    - vpnhub      # VPN hub (tunnel endpoint)
+    - r2          # DMZ gateway (transit zone)
+    - proxy1      # DMZ proxy (secondary observation)
+    - dns1        # DMZ DNS
+    - r3          # internal gateway
+    - db1         # victim database (primary observation)
+    - hr1         # secondary internal service
+
+  cleanup:
+    enabled: true
+
+  parser:
+    enabled: false
+    endpoint:
+      - network/parserapi/csv_parser.py
+    dir:
+      - dataset/csv
+
+  feature_selector:
+    - network/featureselection/feature_selector.py
+
+  feature_selection:
+    DEVICE:            network/featureselectionapi.py:get_device
+    INTERFACE:         network/featureselectionapi.py:get_interface
+    FRAME_NO:          network/featureselectionapi.py:get_frame_number
+    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
+    SOURCE:            network/featureselectionapi.py:get_source
+    DESTINATION:       network/featureselectionapi.py:get_destination
+    PROTOCOL:          network/featureselectionapi.py:get_protocol
+    LENGTH:            network/featureselectionapi.py:get_length
+    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
+    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
+    TOS:               network/featureselectionapi.py:get_tos
+    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
+    TTL:               network/featureselectionapi.py:get_ttl
+    INFO:              network/featureselectionapi.py:get_info
+
+# ── Network settings ──────────────────────────────────────────────────────────
+settings:
+  isp_base_network: "10.0.0.0/8"
+  lan_base_network: "192.168.0.0/16"
+  vpn_base_network: "172.16.0.0/12"
+  vpn_port: 51820
+  log_level: "INFO"
+
+# ── Traffic control ───────────────────────────────────────────────────────────
+# s1-eth0 → vpnhub, s1-eth1 → r1 (external), s1-eth2 → r2 (dmz), s1-eth3 → r3 (internal)
+# lan_sw_external → lse1, lan_sw_dmz → lsd1, lan_sw_internal → lsi1
+traffic_control:
+  s1-eth0:     {area: man}
+  s1-eth1:     {area: man}
+  s1-eth2:     {area: man}
+  s1-eth3:     {area: man}
+  vpnhub-eth0: {area: man}
+  r1-eth0:     {area: man}
+  r1-eth1:     {area: lan}
+  r2-eth0:     {area: man}
+  r2-eth1:     {area: lan}
+  r3-eth0:     {area: man}
+  r3-eth1:     {area: lan}
+  h1-eth0:     {area: lan}
+  h2-eth0:     {area: lan}
+  proxy1-eth0: {area: lan}
+  dns1-eth0:   {area: lan}
+  db1-eth0:    {area: lan}
+  hr1-eth0:    {area: lan}
+
+  links:
+    - interfaces: [s1-eth0, vpnhub-eth0]
+      medium: fiber
+    - interfaces: [s1-eth1, r1-eth0]
+      medium: fiber
+    - interfaces: [s1-eth2, r2-eth0]
+      medium: fiber
+    - interfaces: [s1-eth3, r3-eth0]
+      medium: fiber
+    - interfaces: [r1-eth1, lse1-eth0]
+      medium: copper
+    - interfaces: [r2-eth1, lsd1-eth0]
+      medium: fiber
+    - interfaces: [r3-eth1, lsi1-eth0]
+      medium: fiber
+    - interfaces: [lse1-eth1, h1-eth0]
+      medium: copper
+    - interfaces: [lsd1-eth1, proxy1-eth0]
+      medium: fiber
+    - interfaces: [lsd1-eth2, dns1-eth0]
+      medium: fiber
+    - interfaces: [lsd1-eth3, h2-eth0]
+      medium: copper
+    - interfaces: [lsi1-eth1, db1-eth0]
+      medium: fiber
+    - interfaces: [lsi1-eth2, hr1-eth0]
+      medium: fiber
