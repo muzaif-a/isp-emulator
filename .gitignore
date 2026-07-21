@@ -11,9 +11,9 @@ __pycache__/
 research_stats/
 document/
 tests/*
-debug.py
 run.sh
 requirements-lock.txt
+configs/preregistration.yaml
 
 # Generated datasets
 dataset/pcapng/*
