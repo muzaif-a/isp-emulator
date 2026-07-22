@@ -73,7 +73,8 @@ class TimingProtocol:
 			return 0.0
 
 		if not self._bits_pool:
-			digest = hashlib.sha512(f"{self.secret_key}:{self._current_nonce}".encode("utf-8")).digest()
+			# digest = hashlib.sha512(f"{self.secret_key}:{self._current_nonce}".encode("utf-8")).digest()
+			digest = hashlib.sha512(f"{self.secret_key}:{self.start_timestamp}:{self._current_nonce}".encode("utf-8")).digest()
 			bits: List[int] = []
 			for byte in digest:
 				for shift in range(7, -1, -1):
