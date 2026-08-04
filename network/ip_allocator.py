@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from config_loader import TopologyConfig, NodeConfig
+from errors import EmulatorError
 
 logger = logging.getLogger(__name__)
 
@@ -190,15 +191,11 @@ def _compute_iface_names(
         iface_b = f"{alias_b}-eth{link_count[b]}"
 
         if len(iface_a) > 15:
-            raise ValueError(
-                f"Generated interface name {iface_a!r} ({len(iface_a)} chars) "
-                f"exceeds IFNAMSIZ=15. Alias {alias_a!r} is too long."
-            )
+            raise EmulatorError("R010",
+                f"{iface_a!r} ({len(iface_a)} chars) — node {a!r} alias {alias_a!r} is too long")
         if len(iface_b) > 15:
-            raise ValueError(
-                f"Generated interface name {iface_b!r} ({len(iface_b)} chars) "
-                f"exceeds IFNAMSIZ=15. Alias {alias_b!r} is too long."
-            )
+            raise EmulatorError("R010",
+                f"{iface_b!r} ({len(iface_b)} chars) — node {b!r} alias {alias_b!r} is too long")
 
         link_count[a] += 1
         link_count[b] += 1
@@ -216,7 +213,11 @@ def _allocate_isp(config: TopologyConfig, result: AllocationResult) -> None:
     isp_pool = _subnet_pool(config.settings.isp_base_network, new_prefix=24)
 
     for switch in config.get_switches():          # only ISP switches (not LAN switches)
-        subnet = next(isp_pool)
+        try:
+            subnet = next(isp_pool)
+        except StopIteration:
+            raise EmulatorError("R001",
+                f"increase settings.isp_base_network — ran out of /24s for {switch.name}")
         result.isp_subnets[switch.name] = subnet
         hosts_iter = subnet.hosts()
 
@@ -241,7 +242,11 @@ def _allocate_lan(config: TopologyConfig, result: AllocationResult) -> None:
     lan_pool = _subnet_pool(config.settings.lan_base_network, new_prefix=24)
 
     for gw_name in config.lan_gateways:
-        subnet = next(lan_pool)
+        try:
+            subnet = next(lan_pool)
+        except StopIteration:
+            raise EmulatorError("R001",
+                f"increase settings.lan_base_network — ran out of /24s for gateway {gw_name}")
         result.lan_subnets[gw_name] = subnet
         hosts_iter = subnet.hosts()
         gw_ip = str(next(hosts_iter))   # gateway always gets first host IP (.1)
@@ -304,7 +309,11 @@ def _allocate_vpn(config: TopologyConfig, result: AllocationResult) -> None:
     vpn_pool = _subnet_pool(config.settings.vpn_base_network, new_prefix=24)
 
     for vp in config.vpn_peers:
-        subnet = next(vpn_pool)
+        try:
+            subnet = next(vpn_pool)
+        except StopIteration:
+            raise EmulatorError("R002",
+                f"increase settings.vpn_base_network — ran out of /24s for gateway {vp.gateway}")
         result.vpn_subnets[vp.gateway] = subnet
         hosts_iter = subnet.hosts()
 

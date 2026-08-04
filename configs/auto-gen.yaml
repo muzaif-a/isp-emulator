@@ -1,29 +1,26 @@
 selected:
   # - configs/topology_dmz_segmented.yaml
-  #- configs/topology_enterprise.yaml
-  #- configs/topology_insider_threat.yaml
-  #- configs/topology_remote_worker.yaml
-  #- configs/topology_three_site.yaml
-  #- configs/topology_wan_isp.yaml
-  #- configs/topology.yaml
+  - configs/topology_enterprise.yaml
+  # - configs/topology_insider_threat.yaml
+  # - configs/topology_remote_worker.yaml
+  # - configs/topology_three_site.yaml
+  # - configs/topology_wan_isp.yaml
+  # - configs/topology.yaml
 repeat: 1
 
 vpn:
   - on
-  - off
+  # - off
 
 npc:
-  - low
+  # - low
   - medium
-  - high
+  # - high
 
 inject:
   - on
-  - off
+  # - off
 
 exfil:
-  - true
-  #- false
-
-wait:
-  - 10
+  # - on
+  - off

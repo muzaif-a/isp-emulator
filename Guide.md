@@ -48,6 +48,7 @@ For architecture and internals, see [README.md](README.md).
 7. [Common Mistakes](#7-common-mistakes)
 8. [Best Practices](#8-best-practices)
 9. [Developer Recipes](#9-developer-recipes)
+10. [Error Codes](#10-error-codes)
 
 ---
 
@@ -57,26 +58,41 @@ For architecture and internals, see [README.md](README.md).
 
 Ubuntu 22.04 LTS (other Linux distributions may work; Windows and macOS are not supported for topology emulation).
 
-### System packages
+### Automated install (recommended)
+
+```bash
+sudo bash scripts/setup.sh
+```
+
+Installs all system and Python packages, loads the WireGuard kernel module, and verifies the installation.
+
+### Manual — system packages
 
 ```bash
 sudo apt-get install -y \
+    python3 python3-pip \
     mininet \
-    openvswitch-switch \
-    wireguard \
-    wireguard-tools \
-    python3 \
-    python3-pip \
-    iproute2 \
-    iptables \
-    iputils-ping \
-    net-tools \
-    tcpdump \
-    wireshark-common \
-    curl
+    openvswitch-switch openvswitch-common \
+    wireguard wireguard-tools \
+    iproute2 iptables \
+    iputils-ping net-tools \
+    tcpdump wireshark-common \
+    curl dnsutils iperf3
 ```
 
-### Python packages
+| Package | Purpose |
+|---------|---------|
+| `mininet` | Network emulation framework |
+| `openvswitch-switch` | OVS bridges (required by Mininet) |
+| `wireguard wireguard-tools` | WireGuard VPN kernel module + `wg` CLI |
+| `iproute2` | `ip`, `tc` — routing and traffic control |
+| `iptables` | NAT/masquerade rules |
+| `tcpdump` | Low-level packet capture |
+| `wireshark-common` | `mergecap` for PCAPNG merging |
+| `iperf3` | NPC bulk traffic behavior |
+| `dnsutils` | `dig` for NPC DNS behavior |
+
+### Manual — Python packages
 
 ```bash
 pip3 install -r requirements.txt
@@ -231,7 +247,7 @@ lans:
 |-----|------|----------|---------|-------------|
 | `name` | string | yes | — | LAN identifier. LAN switch named `lan_sw_{name}`. |
 | `gateway` | string | yes | — | Router node. Auto-created if not in `nodes`. |
-| `isp_switch` | string | no | `s1` | ISP switch this LAN connects to. |
+| `isp_switch` | string | **yes** | — | ISP switch this LAN connects to. Must match a declared switch node. |
 | `hosts` | list[string] | no | `[]` | Host nodes. Auto-created. |
 
 Links created: `isp_switch ↔ gateway ↔ lan_sw_{name} ↔ each host`.
@@ -261,7 +277,7 @@ vpn:
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Deploy WireGuard on startup. |
 | `mode` | string | `site_to_site` | VPN mode (see below). |
-| `nat` | bool | `false` | `iptables MASQUERADE` for VPN traffic at gateway. |
+| `nat` | bool | `false` | When `true`: gateway masquerades VPN traffic to non-LAN destinations only. Each VPN client node also masquerades its LAN IP as its VPN IP on `wg0`, so hosts inside the network see the real VPN IP of the attacker — not the gateway IP and not the LAN IP. |
 | `server.node` | string | — | VPN hub node name. |
 | `peers` | list[string] | `[]` | LAN gateway peers (site-to-site / hybrid). |
 | `clients` | list[string] | `[]` | Host-level VPN clients (remote_access / hybrid). |
@@ -363,7 +379,7 @@ databases:
     api_port: 9090
     timing_protocol:
       enabled: true
-      secret_key: example_key
+      secret_key: your-real-secret-here   # required — never use a placeholder
       short_delay_ms: 20
       long_delay_ms: 50
     tables:
@@ -392,12 +408,12 @@ databases:
 
 **timing_protocol keys:**
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | bool | `false` | Activate timing channel. |
-| `secret_key` | string | `example_key` | SHA-512 key for deterministic bit generation. |
-| `short_delay_ms` | float | `20.0` | Inter-packet delay for bit=0 (ms). |
-| `long_delay_ms` | float | `50.0` | Inter-packet delay for bit=1 (ms). |
+| Key | Type | Required | Default | Description |
+|-----|------|----------|---------|-------------|
+| `enabled` | bool | no | `false` | Activate timing channel. |
+| `secret_key` | string | **yes if enabled** | — | SHA-512 key for deterministic bit generation. No default — must be explicitly set. |
+| `short_delay_ms` | float | no | `20.0` | Inter-packet delay for bit=0 (ms). |
+| `long_delay_ms` | float | no | `50.0` | Inter-packet delay for bit=1 (ms). |
 
 **table keys:**
 
@@ -416,20 +432,21 @@ databases:
 | `float` | Random float 0.0–10,000.0 |
 | `first_name` | Random first name |
 | `last_name` | Random last name |
+| `username` | `firstname.lastname{NN}` (context-aware) |
 | `email` | `firstname.lastname@domain` (context-aware) |
 | `phone` | Phone number string |
 | `department` | Department name |
-| `salary` | Salary integer |
+| `salary` | Salary float 28,000–180,000 |
 | `product` | Product name |
 | `category` | Category name |
-| `price` | Price float |
+| `price` | Price float 0.99–9,999.99 |
 | `address` | Street address |
 | `city` | City name |
 | `country` | Country name |
 | `boolean` | `True` or `False` |
 | `text` | Short random text |
 | `uuid` | UUID v4 string |
-| `date` | Date string |
+| `date` | Date string YYYY-MM-DD |
 | `timestamp` | Unix timestamp integer |
 
 `id` column is always sequential (1, 2, 3…) regardless of declared type.
@@ -527,6 +544,15 @@ capture:
 | `merged` | string | `dataset/pcapng` | Merged PCAPNG output directory. |
 | `devices` | list[string] | `[]` | Node names to capture. Can also appear at top level (backward compat). |
 
+**schema keys** (nested under `capture.schema`):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `file` | string | `dataset/schema.json` | Path to the schema JSON output file. |
+| `network_profile` | string | `dataset/network_profile.json` | Path to the network profile JSON (TC commands per session). |
+| `update_folder` | string | same as `merged` | Folder watched for new merged PCAPNGs to trigger schema update. |
+| `mimetype` | string | `text/pcapng` | MIME type recorded in schema records. |
+
 **cleanup keys:**
 
 | Key | Type | Default | Description |
@@ -570,7 +596,7 @@ If `cleanup:` section is absent, cleanup is disabled.
 | `get_destination_port` | TCP/UDP destination port |
 | `get_info` | Wireshark-style info string |
 | `get_tos` | IP TOS field as integer string |
-| `get_is_attack` | `1` if TOS=0x10, `0` otherwise |
+| `get_is_attack` | `1` if `IP.tos == exfiltration.attack_tos`, `0` otherwise. TOS value read from `ATTACK_TOS` env var set by capture_manager from YAML. |
 | `get_ttl` | IP TTL |
 
 ---
@@ -663,7 +689,36 @@ Values: `low`, `medium`, `high`. Per-host defaults; overridden by `npc start --i
 
 Behavior mix (CAIDA-derived): HTTP 65%, Bulk 15%, DNS 8%, FTP 5%, SMTP 5%, DB 2%, Echo 1%.
 
-NPC resolves service IPs at startup: `web1` (HTTP/SMTP), `ftp1` (FTP), `dns1` (DNS), `db1` (DB API), `h1` (echo). Missing nodes are skipped.
+NPC resolves service targets at startup from `services:` and `databases:` sections — no hardcoded node names. It finds the first node of each type: `http` → web traffic and SMTP, `ftp` → FTP, `dns` → DNS, `echo` → echo. DB REST endpoint comes from the first entry in `databases:`. DNS query domains are derived from actual topology node names as `{name}.local`. Behaviors are silently skipped if the required service type is absent from `services:`.
+
+**Optional: `npc.weights` — override CAIDA behavior mix per intensity**
+
+Specify only the behaviors you want to change. Unspecified behaviors keep CAIDA defaults.
+
+```yaml
+npc:
+  hosts:
+    h2: high
+  weights:
+    high:               # only overrides 'high' intensity
+      http: 80          # more HTTP-heavy topology
+      # bulk: 15        # ← not listed = keeps CAIDA default (15)
+      # dns: 8          # ← not listed = keeps CAIDA default (8)
+      # all others unchanged
+```
+
+| Behavior | Valid values | Default (CAIDA) |
+|----------|-------------|-----------------|
+| `http` | int ≥ 0 | low=13, medium=39, high=65 |
+| `bulk` | int ≥ 0 | low=3, medium=9, high=15 |
+| `dns` | int ≥ 0 | low=2, medium=5, high=8 |
+| `ftp` | int ≥ 0 | low=1, medium=3, high=5 |
+| `smtp` | int ≥ 0 | low=1, medium=3, high=5 |
+| `db` | int ≥ 0 | low=1, medium=1, high=2 |
+| `echo` | int ≥ 0 | low=0, medium=1, high=2 |
+| `idle` | int ≥ 0 | low=79, medium=39, high=0 |
+
+Omitting `npc.weights:` entirely uses full CAIDA defaults — no override needed for standard experiments.
 
 ---
 
@@ -696,32 +751,42 @@ device_classes:
 
 ### 3.15 attackers
 
+**Optional.** Only needed when `exfiltration.attacker` is NOT set and you want `exfil` to pick randomly from a declared pool.
+
 ```yaml
 attackers:
   - h2
   - h4
 ```
 
-Nodes eligible as exfil sources. `exfil` picks randomly from this list (filtered to nodes present in current net). Attacker traffic marked with `IP_TOS=0x10` at socket level.
+When `exfiltration.attacker` is set, this section is not required — the exfil command uses `exfiltration.attacker` directly and ignores the pool. If both are present, `exfiltration.attacker` must be in this list (error E013 fires otherwise).
 
 ---
 
 ### 3.16 exfiltration
 
-Fallback parameters if automatic DB discovery fails.
+Pins the exfil command to specific attacker, target, and endpoints. When set, `exfil` uses these values directly — no `attackers:` list required. When `attacker` is absent, `exfil` selects randomly from `attackers:` (filtered to nodes in current net).
 
 ```yaml
 exfiltration:
-  attacker: h1
+  attacker: h1              # node that initiates the exfil connection
   target:
-    host: db1
-    port: 9090
+    host: db1               # database node to target
+    port: 9090              # API port (must match databases[].api_port)
   endpoints:
     - /api/employees
     - /api/products
 ```
 
-In practice, `exfil` discovers victims from `databases:` at runtime.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `attacker` | string | — | Node that initiates the exfil connection. Falls back to random from `attackers:` if absent. |
+| `target.host` | string | — | Database node to target. Falls back to random from `databases:` if absent. |
+| `target.port` | int | — | API port. Must match `databases[].api_port`. |
+| `endpoints` | list[string] | — | REST paths to request. Falls back to `/api/{table}` for each table. |
+| `attack_tos` | int | `0x10` | IP TOS byte the attacker stamps on packets. Server sniffer and feature extractor use this same value. Change consistently if you need a different marking. |
+
+`attack_tos` belongs here (attacker behavior) not in `timing_protocol` (server behavior).
 
 ---
 
@@ -886,10 +951,23 @@ Full Cartesian product of all list fields × `repeat`.
 topologies × vpn × npc × inject × exfil × wait × repeat
 ```
 
-Example with defaults (`configs/auto-gen.yaml`):
+Example — current `configs/auto-gen.yaml` (one option per dimension):
 ```
-1 × 2 × 3 × 2 × 1 × 1 × 1 = 12 experiments
+1 topo × 1 vpn × 1 npc × 1 inject × 1 exfil × 1 wait × repeat=1 = 1 experiment
 ```
+
+Example — full dataset (uncomment all options, repeat=3):
+```
+2 topo × 2 vpn × 3 npc × 2 inject × 2 exfil × 2 wait × 3 = 288 experiments
+```
+
+| Combo | Label | Meaning |
+|-------|-------|---------|
+| exfil=true, inject=on | 1 | Attack + watermark |
+| exfil=false, inject=on | 0 | Baseline (no attack) |
+| exfil=true, inject=off | 1 | Attack, no watermark |
+| vpn=on | — | Traffic via WireGuard tunnel |
+| npc=low/medium/high | — | Channel noise level |
 
 Each experiment is fully isolated: `mn -c` before and after; fresh `topology.py --cli` subprocess; pexpect CLI driver.
 
@@ -986,9 +1064,13 @@ POSTs `{"enabled": bool, "short_delay_ms": N, "long_delay_ms": N}` to every runn
 exfil [--dry-run]
 ```
 
-Picks random attacker (from `attackers:` in all `configs/topology*.yaml`) and random victim database (from current config's `databases:`). Sends TOS-marked HTTP GET (`IP_TOS=0x10` at socket level, scoped to this connection only).
+Selection priority:
+1. Uses `exfiltration.attacker` and `exfiltration.target.*` from YAML if set — no `attackers:` list needed.
+2. Falls back to random from `attackers:` list (aggregated across all `configs/topology*.yaml`) if `exfiltration.attacker` is absent.
 
-`--dry-run`: print selection without executing. Retries every 10 s if no attackers or victims found.
+Sends TOS-marked HTTP GET with `IP_TOS = exfiltration.attack_tos` at socket level (default `0x10`), scoped to this connection only. Concurrent NPC traffic is never marked.
+
+`--dry-run`: print selection without executing. Retries every 10 s if no attacker or victim found.
 
 ---
 
@@ -1079,7 +1161,14 @@ vpn:
   mode: remote_access
   nat: true
 
-attackers: [h2]
+exfiltration:
+  attacker: h2
+  target:
+    host: h3
+    port: 9090
+  endpoints:
+    - /api/users
+  attack_tos: 0x10
 
 services:
   - node: h3
@@ -1093,13 +1182,13 @@ databases:
     api_port: 9090
     timing_protocol:
       enabled: true
-      secret_key: example_key
+      secret_key: your-real-secret-here
     tables:
       - name: users
         rows: 50
         schema:
           id: integer
-          username: text
+          username: username
           email: email
 
 deployment:
@@ -1271,4 +1360,386 @@ with PcapNgFile("dataset/pcapng/20260722_083000_123456.pcapng") as f:
 
 ---
 
-*For architecture and internals, see [README.md](README.md).*
+## 10. Error Codes
+
+When the emulator encounters a configuration or runtime problem it prints a structured error block:
+
+```
+────────────────────────────────────────────────────────────
+  ISP Emulator Error  [E011]
+────────────────────────────────────────────────────────────
+  Problem   : timing_protocol enabled but secret_key is not set
+  Detail    : db 'victimdb' on h3 — add secret_key under timing_protocol:
+  YAML key  : timing_protocol.secret_key
+  Guide.md  : §3.7 databases → timing_protocol
+────────────────────────────────────────────────────────────
+  Run:  grep -A 20 '§3.7 databases → timing_protocol' Guide.md
+────────────────────────────────────────────────────────────
+```
+
+Every code maps to a YAML key and a Guide section. Use the `Run:` command to jump straight to the fix.
+
+---
+
+### E000 — Config file not found
+
+**YAML key:** `selected` / config path  
+**Fix:** Check the path passed to `sudo python3 network/topology.py <path>`. The file must exist relative to the project root.
+
+---
+
+### E001 — LAN missing `isp_switch`
+
+**YAML key:** `lans[].isp_switch`  
+**Fix:** Add `isp_switch: <switch_name>` to every entry under `lans:`. The value must match a node declared with `type: switch`.
+
+```yaml
+lans:
+  - name: office
+    gateway: r1
+    isp_switch: s1    # ← required
+    hosts: [h1, h2]
+```
+
+---
+
+### E002 — No ISP switch
+
+**YAML key:** `nodes[]`  
+**Fix:** Add at least one node with `type: switch`. See §3.1.
+
+---
+
+### E003 — Link references undeclared node
+
+**YAML key:** `links[]`  
+**Fix:** Declare the missing node under `nodes:` before referencing it in `links:`. See §3.2.
+
+---
+
+### E004 — `lan_gateway` references unknown node
+
+**YAML key:** `lan_gateways[]`  
+**Fix:** Add the node to `nodes:` or remove it from `lan_gateways:`. See §3.3.
+
+---
+
+### E005 — `lan_gateway` is a switch
+
+**YAML key:** `lan_gateways[]`  
+**Fix:** LAN gateways must be `type: router` or `type: host`. Change the node type or remove it from `lan_gateways:`.
+
+---
+
+### E006 — `vpn_gateway` references unknown node
+
+**YAML key:** `vpn_gateways[]`  
+**Fix:** Declare the node under `nodes:` first. See §3.4.
+
+---
+
+### E007 — VPN peer gateway unknown
+
+**YAML key:** `vpn_peers[].gateway`  
+**Fix:** The gateway name must match a declared node. See §3.5.
+
+---
+
+### E008 — VPN peer client unknown
+
+**YAML key:** `vpn_peers[].clients`  
+**Fix:** The client name must match a declared node. See §3.5.
+
+---
+
+### E009 — Service host not declared
+
+**YAML key:** `services[].node`  
+**Fix:** Add the host node to `nodes:` or fix the `node:` value under `services:`. See §3.6.
+
+---
+
+### E010 — Database host not declared
+
+**YAML key:** `databases[].host`  
+**Fix:** Add the host node to `nodes:` or fix the `host:` value under `databases:`. See §3.7.
+
+---
+
+### E011 — `timing_protocol` enabled but no `secret_key`
+
+**YAML key:** `timing_protocol.secret_key`  
+**Fix:** Add a non-empty `secret_key` under `timing_protocol:`. Never use `"example_key"` in production.
+
+```yaml
+timing_protocol:
+  enabled: true
+  secret_key: your-real-secret-here   # ← required when enabled: true
+```
+
+---
+
+### E012 — `short_delay_ms` ≥ `long_delay_ms`
+
+**YAML key:** `timing_protocol.short_delay_ms` / `long_delay_ms`  
+**Fix:** `short_delay_ms` must be strictly less than `long_delay_ms`. The gap must exceed the maximum jitter on the path.
+
+---
+
+### E013 — `exfiltration.attacker` not in `attackers:`
+
+**YAML key:** `exfiltration.attacker`  
+**Fix:** Three options:
+
+1. Remove the `attackers:` section entirely — it is not required when `exfiltration.attacker` is set:
+```yaml
+# remove attackers: block
+exfiltration:
+  attacker: h2
+```
+
+2. Add the node to `attackers:`:
+```yaml
+attackers:
+  - h2      # ← must include exfiltration.attacker value
+exfiltration:
+  attacker: h2
+```
+
+3. Change `exfiltration.attacker` to match a node already in `attackers:`.
+
+---
+
+### E014 — `exfiltration.target.host` has no `api_port`
+
+**YAML key:** `exfiltration.target.host`  
+**Fix:** Add `api_port: <port>` to the matching entry under `databases:`. See §3.7.
+
+---
+
+### E015 — `attack_tos` out of range
+
+**YAML key:** `exfiltration.attack_tos`  
+**Fix:** Set `attack_tos` to an integer between `0` and `255` (e.g., `0x10`). See §3.16.
+
+---
+
+### E016 — `exfiltration.target.port` mismatch
+
+**YAML key:** `exfiltration.target.port`  
+**Fix:** The port in `exfiltration.target.port` must equal `databases[host=<target>].api_port`. Fix one or the other.
+
+---
+
+### E017 — Capture device not found or empty
+
+**YAML key:** `capture.devices`  
+**Fix:** Add node names to `capture.devices`. Every name must match a node declared in `nodes:`. See §3.10.
+
+---
+
+### E018 — VPN enabled but `vpn.server.node` not set
+
+**YAML key:** `vpn.server.node`  
+**Fix:** Either set `vpn.server.node: <gateway_name>` or set `vpn.enabled: false`.
+
+```yaml
+vpn:
+  enabled: true
+  server:
+    node: vpnhub    # ← required when enabled: true
+```
+
+---
+
+### E019 — Invalid `dpid`
+
+**YAML key:** `nodes[].dpid`  
+**Fix:** `dpid` must be 1–16 hexadecimal characters (`0-9`, `a-f`). Omit it to auto-generate from the node name.
+
+---
+
+### E021 — Unknown service type
+
+**YAML key:** `services[].type`  
+**Fix:** Use a supported type: `http | https | ftp | smtp | dns | echo | ssh | custom_tcp | custom_udp`
+
+---
+
+### E022 — Port conflict on same host
+
+**YAML key:** `services[].port`  
+**Fix:** Two services on the same host share a port. Give each a unique `port:` value.
+
+---
+
+### E023 — Unknown database column generator type
+
+**YAML key:** `databases[].tables[].schema`  
+**Fix:** Use a supported generator type. Valid types: `integer`, `int`, `float`, `first_name`, `last_name`, `username`, `email`, `phone`, `department`, `salary`, `product`, `category`, `price`, `address`, `city`, `country`, `boolean`, `text`, `uuid`, `date`, `timestamp`.
+
+---
+
+### E027 — Static route node not declared
+
+**YAML key:** `routes[].node`  
+**Fix:** Declare the node under `nodes:` or remove the route entry. See §3.17.
+
+---
+
+### E028 — Static route invalid CIDR or IP
+
+**YAML key:** `routes[].destination` / `routes[].via`  
+**Fix:** Use valid IPv4 CIDR (`10.0.0.0/24`) and valid IPv4 nexthop (`10.0.0.1`).
+
+---
+
+### E030 — Attacker not in nodes
+
+**YAML key:** `attackers[]` or `exfiltration.attacker`  
+**Fix:** Declare the attacker node under `nodes:`, or remove it from `attackers:`.
+
+---
+
+### E032 — Invalid VPN mode
+
+**YAML key:** `vpn.mode`  
+**Fix:** Use one of: `site_to_site | remote_access | hybrid`
+
+---
+
+### E033 — Invalid firewall policy
+
+**YAML key:** `security.firewall.policy`  
+**Fix:** Use one of: `restrictive | permissive`
+
+---
+
+### E034 — Invalid firewall backend
+
+**YAML key:** `security.firewall.backend`  
+**Fix:** Use one of: `iptables | nftables`
+
+---
+
+### E035 — Invalid deployment mode
+
+**YAML key:** `deployment.mode`  
+**Fix:** Use one of: `auto | manual | hybrid`
+
+---
+
+### E037 — Invalid NPC intensity
+
+**YAML key:** `npc.hosts`  
+**Fix:** Use one of: `low | medium | high` per host.
+
+---
+
+### E038 — Invalid node type
+
+**YAML key:** `nodes[].type`  
+**Fix:** Use one of: `host | router | switch`
+
+---
+
+### E039 — Invalid CIDR in settings
+
+**YAML key:** `settings.isp_base_network` / `lan_base_network` / `vpn_base_network`  
+**Fix:** Use valid IPv4 CIDR notation (e.g., `10.0.0.0/8`, `192.168.0.0/16`).
+
+---
+
+### E042 — `api_port` out of range
+
+**YAML key:** `databases[].api_port`  
+**Fix:** Set `api_port` to a value between `1` and `65535`.
+
+---
+
+### E043 — Service `port` out of range
+
+**YAML key:** `services[].port`  
+**Fix:** Set `port` to a value between `1` and `65535`.
+
+---
+
+### E044 — Timing delay not positive
+
+**YAML key:** `databases[].timing_protocol.short_delay_ms` / `long_delay_ms`  
+**Fix:** Both delays must be `> 0`. Typical values: `short_delay_ms: 20.0`, `long_delay_ms: 50.0`.
+
+---
+
+### E045 — `device_classes` references unknown node
+
+**YAML key:** `device_classes`  
+**Fix:** Every key must match a node declared under `nodes:`. Remove the entry or add the node.
+
+---
+
+### E046 — `traffic_control` interface references unknown node
+
+**YAML key:** `traffic_control.interfaces`  
+**Note:** Validated at topology build time (after alias computation), not at config load. A `[WARN]` is printed at startup — the interface is silently skipped. Check the node part (before `-eth`) matches a declared node name or its Mininet alias.
+
+---
+
+### E047 — Duplicate client in `vpn_peers`
+
+**YAML key:** `vpn_peers[].clients`  
+**Fix:** Each client must appear once only in the `clients:` list.
+
+---
+
+### E048 — `npc.hosts` references unknown node
+
+**YAML key:** `npc.hosts`  
+**Fix:** Every host key must match a node declared under `nodes:`.
+
+---
+
+### E049 — `npc.weights` unknown behavior or invalid weight
+
+**YAML key:** `npc.weights`  
+**Fix:** Use only supported behavior names (`http`, `bulk`, `dns`, `ftp`, `smtp`, `db`, `echo`, `idle`) and non-negative integer weights.
+
+---
+
+### R001 — LAN subnet pool exhausted
+
+**YAML key:** `settings.lan_base_network`  
+**Fix:** Increase the `lan_base_network` range (e.g., change `/16` to `/12`) or reduce the number of LAN gateways. See §3.12.
+
+---
+
+### R002 — VPN subnet pool exhausted
+
+**YAML key:** `settings.vpn_base_network`  
+**Fix:** Increase the `vpn_base_network` range or reduce the number of VPN peer groups. See §3.12.
+
+---
+
+### R010 — Interface name exceeds IFNAMSIZ=15
+
+**YAML key:** `nodes[]`  
+**Fix:** Shorten the node name. Linux limits interface names to 15 characters. The emulator auto-aliases names longer than 9 chars but the alias itself must fit. Node names ≤ 9 characters are safe.
+
+---
+
+### R020 — WireGuard key generation failed
+
+**YAML key:** *(system)*  
+**Fix:** Install WireGuard tools: `sudo apt-get install wireguard wireguard-tools`. See §1 Installation.
+
+---
+
+### R101 — Timing protocol `secret_key` is `None` at runtime
+
+**YAML key:** `databases[].timing_protocol.secret_key`  
+**Fix:** Same as E011 — set a non-empty `secret_key` in the YAML before starting the emulator.
+
+---
+
+*For architecture and internals, see [README.md](README.md).*  
+*For physics formulas (TBF+netem, NPC traffic model, timing protocol), see [mechanism.md](mechanism.md).*

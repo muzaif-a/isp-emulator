@@ -45,9 +45,15 @@ device_classes:
   web1:    datacenter_server
   dns1:    datacenter_server
 
-attackers:
-  - h1    # Branch A attacker
-  - h3    # Branch B attacker
+exfiltration:
+  attacker: h1
+  target:
+    host: db1
+    port: 9090
+  endpoints:
+    - /api/employees
+    - /api/products
+  attack_tos: 0x10
 
 # ── ISP backbone and VPN hub ───────────────────────────────────────────────────
 nodes:

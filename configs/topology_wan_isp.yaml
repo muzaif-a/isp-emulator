@@ -45,8 +45,15 @@ device_classes:
   h1:      lan_host
   h2:      lan_host
 
-attackers:
-  - h1    # Site B attacker
+exfiltration:
+  attacker: h1
+  target:
+    host: db1
+    port: 9090
+  endpoints:
+    - /api/employees
+    - /api/products
+  attack_tos: 0x10
 
 # ── ISP backbone and VPN hub ───────────────────────────────────────────────────
 nodes:

@@ -71,6 +71,11 @@ def generate(field_type: str, context: Dict[str, Any] = None) -> Any:
     if ft == "last_name":
         return random.choice(_LAST_NAMES)
 
+    if ft == "username":
+        fn = random.choice(_FIRST_NAMES).lower()
+        ln = random.choice(_LAST_NAMES).lower()
+        return f"{fn}.{ln}{random.randint(1, 99)}"
+
     if ft == "email":
         fn = ctx.get("first_name", random.choice(_FIRST_NAMES))
         ln = ctx.get("last_name", random.choice(_LAST_NAMES))

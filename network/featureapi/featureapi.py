@@ -6,9 +6,11 @@ Users can create additional feature modules and reference them in the YAML
 Features section without modifying any framework code.
 """
 
+import os
+
 from scapy.all import IP, IPv6, TCP, UDP, ICMP, Ether, ARP
 
-ATTACK_TOS = 0x10   # TOS bit that identifies attacker request traffic
+ATTACK_TOS = int(os.environ.get("ATTACK_TOS", "0x10"), 0)
 
 
 def get_device(packet) -> str:

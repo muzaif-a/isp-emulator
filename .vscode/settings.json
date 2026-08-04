@@ -1,0 +1,8 @@
+{
+    "Codegeex.GenerationPreference": "automatic",
+    "Codegeex.RepoIndex": true,
+    "Codegeex.Chat.LanguagePreference": "English",
+    "Codegeex.Chat.fontSize": 13,
+    "Codegeex.CommitMessageStyle": "Default",
+    "Codegeex.CompletionDelay": 0.5
+}

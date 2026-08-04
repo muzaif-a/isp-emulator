@@ -66,6 +66,7 @@ class _NullController(Node):
         pass
 
 from config_loader import load_config, TopologyConfig
+from errors import EmulatorError
 from network.ip_allocator import allocate, AllocationResult
 from network.routers import LinuxRouter
 from network.routing import configure_routes, dump_route_tables
@@ -98,24 +99,24 @@ except ImportError:
     _NPC_AVAILABLE = False
 
 
-def _tos_exfil_script(ip: str, port: int, table: str) -> str:
+def _tos_exfil_script(ip: str, port: int, endpoint: str, tos: int = 0x10) -> str:
     """Python script executed inside the attacker's Mininet namespace.
 
-    Sets IP_TOS=0x10 at the socket level before connect() so only this
-    specific socket carries TOS marking.  No host-wide iptables rule is
-    added, so concurrent NPC db_query traffic on the same attacker host
-    produces unmarked packets and cannot trigger a spurious timing session.
+    Sets IP_TOS at the socket level before connect() so only this specific
+    socket carries TOS marking. No host-wide iptables rule is added, so
+    concurrent NPC traffic produces unmarked packets and cannot trigger a
+    spurious timing session.
     """
     return (
         "import socket, http.client, sys\n"
         "class _TOS(http.client.HTTPConnection):\n"
         "    def connect(self):\n"
         "        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-        "        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)\n"
+        f"        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, {tos})\n"
         "        self.sock.settimeout(self.timeout)\n"
         "        self.sock.connect((self.host, self.port))\n"
         f"c = _TOS('{ip}', {port}, timeout=10)\n"
-        f"c.request('GET', '/api/{table}')\n"
+        f"c.request('GET', '{endpoint}')\n"
         "r = c.getresponse(); r.read(); print(r.status)\n"
     )
 
@@ -339,47 +340,57 @@ class ISPCli(CLI):
             self._cap_mgr.set_tc_profile(profile.commands)
 
     def do_exfil(self, line: str) -> None:
-        """TOS-marked exfiltration: discovers attackers + databases from all
-        configs/topology*.yaml files, picks random attacker + victim + table.
+        """HTTP GET to DB — TOS-marked (on) or plain (off).
 
         Usage:
-          exfil           — random attacker + victim + table
-          exfil --dry-run — print selection without running
+          exfil on            — GET with TOS=0x10  (attack traffic, label=1)
+          exfil off           — GET with TOS=0     (normal traffic, label=0)
+          exfil on --dry-run  — print selection without running
 
-        Mechanism:
-          Python HTTP client with socket.IP_TOS=0x10 set before connect().
-          TOS is scoped to this socket only — no host-wide iptables rule —
-          so concurrent NPC db_query traffic on the same attacker host is
-          never marked and cannot trigger a spurious timing session.
+        Both modes discover attackers + databases from all configs/topology*.yaml
+        files and pick a random attacker + victim + endpoint.
+
+        TOS is scoped to the socket only — no host-wide iptables rule.
         """
         import random
         import time
         from pathlib import Path
         from config_loader import load_config
 
-        dry_run = "--dry-run" in line
+        tokens = line.split()
+        dry_run = "--dry-run" in tokens
+        mode_tokens = [t for t in tokens if t != "--dry-run"]
+
+        if not mode_tokens or mode_tokens[0] not in ("on", "off"):
+            print("[exfil] Usage: exfil on|off [--dry-run]", flush=True)
+            return
+
+        mode = mode_tokens[0]
 
         config_dir = Path(__file__).resolve().parent.parent / "configs"
         yaml_files = sorted(config_dir.glob("topology*.yaml"))
 
         while True:
-            # Step 1: Attackers — aggregate from all topology YAMLs so any
-            # host that is an attacker in ANY topology and exists in the current
-            # net is eligible.  Victims — current config ONLY: other topologies
-            # may have DB hosts whose names collide with non-DB hosts in the
-            # current net (e.g. h3 is a DB in topology.yaml but a plain user
-            # in insider_threat), causing exfil to curl a host with no API.
-            raw_attackers: list = list(getattr(self._config, "attackers", []))
-            for yaml_path in yaml_files:
-                try:
-                    cfg = load_config(str(yaml_path))
-                    raw_attackers.extend(cfg.attackers)
-                except Exception:
-                    continue
+            exfil_cfg = getattr(self._config, "exfiltration", None)
+            cfg_attacker = getattr(exfil_cfg, "attacker", None)
 
-            # Step 2: Filter to hosts present in current net; resolve victim IPs
-            attackers = [a for a in dict.fromkeys(raw_attackers) if a in self.mn]
+            # Step 1: Build attacker pool.
+            # If exfiltration.attacker is set, use it directly — attackers: list
+            # is not required. If not set, fall back to the attackers: list
+            # aggregated across all topology YAMLs.
+            if cfg_attacker and cfg_attacker in self.mn:
+                attackers = [cfg_attacker]
+            else:
+                raw_attackers: list = list(getattr(self._config, "attackers", []))
+                for yaml_path in yaml_files:
+                    try:
+                        cfg = load_config(str(yaml_path))
+                        raw_attackers.extend(cfg.attackers)
+                    except Exception:
+                        continue
+                attackers = [a for a in dict.fromkeys(raw_attackers) if a in self.mn]
 
+            # Step 2: Resolve victim IPs from current config databases
             victims = []
             seen_hosts: set = set()
             for db in getattr(self._config, "databases", []):
@@ -398,8 +409,7 @@ class ISPCli(CLI):
 
             # Step 3: Check attackers and victims exist
             if not attackers or not victims:
-                print("[exfil] Attack not possible — no attackers or victim DBs. "
-                      "Waiting 10s …", flush=True)
+                print("[exfil] No attackers or victim DBs. Waiting 10s …", flush=True)
                 time.sleep(10)
                 continue
 
@@ -408,22 +418,35 @@ class ISPCli(CLI):
 
             # Step 5: Check filtered victims have tables
             if not filtered_victims:
-                print("[exfil] Exfil attempt failed — no victim DB has tables. "
-                      "Waiting 10s …", flush=True)
+                print("[exfil] No victim DB has tables. Waiting 10s …", flush=True)
                 time.sleep(10)
                 continue
 
-            # Step 6: Random selection — attacker, victim, table
-            attacker_name = random.choice(attackers)
-            victim        = random.choice(filtered_victims)
-            table_name    = random.choice(victim["tables"])
+            # Step 6: Selection — exfil_cfg/cfg_attacker already resolved above
+            cfg_target    = getattr(exfil_cfg, "target_host", None)
+            cfg_endpoints = getattr(exfil_cfg, "endpoints", None) or []
+
+            attacker_name = attackers[0] if len(attackers) == 1 else random.choice(attackers)
+            victim = (
+                next((v for v in filtered_victims if v["host"] == cfg_target), None)
+                if cfg_target else None
+            ) or random.choice(filtered_victims)
+
+            # Endpoint: from exfiltration config, else random table
+            if cfg_endpoints:
+                endpoint = random.choice(cfg_endpoints)
+            else:
+                endpoint = f"/api/{random.choice(victim['tables'])}"
+
+            # on=TOS-marked (attack), off=plain (normal)
+            tos = getattr(exfil_cfg, "attack_tos", 0x10) if mode == "on" else 0
 
             port = victim["port"]
             ip   = victim["ip"]
 
             print(
-                f"[exfil] attacker={attacker_name}  victim={victim['host']}:{port}"
-                f"  table={table_name}  ip={ip}",
+                f"[exfil] mode={mode}  attacker={attacker_name}  victim={victim['host']}:{port}"
+                f"  endpoint={endpoint}  ip={ip}  tos={hex(tos)}",
                 flush=True,
             )
 
@@ -433,18 +456,15 @@ class ISPCli(CLI):
 
             node = self.mn[attacker_name]
 
-            # Step 7: Run TOS-marked GET inside attacker's network namespace.
-            # IP_TOS is set at the socket level before connect(), scoping the
-            # marking to this one connection only.
+            # Step 7: Run GET inside attacker's network namespace.
             proc = node.popen(
-                [sys.executable, "-c", _tos_exfil_script(ip, port, table_name)],
+                [sys.executable, "-c", _tos_exfil_script(ip, port, endpoint, tos)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
             out, _ = proc.communicate()
             result = out.decode().strip() if out else ""
 
-            # Step 8-9: Commands complete; end
             print(f"[exfil] Done. HTTP status: {result}", flush=True)
             return
 
@@ -588,6 +608,8 @@ class ISPTopology:
             self.config = load_config(self.config_path)
             print(f"[DBG-1] Config OK: {len(self.config.nodes)} nodes, "
                   f"{len(self.config.links)} links", flush=True)
+        except EmulatorError as e:
+            e.print_and_exit()
         except Exception:
             print("[DBG-1] EXCEPTION in load_config:", flush=True)
             _tb.print_exc()
@@ -610,6 +632,20 @@ class ISPTopology:
             raise
         print_allocation(self.allocation)
         print_iface_aliases(self.allocation)
+
+        # ── Validate TC interface names against allocation aliases ───────────
+        tc_cfg = getattr(self.config, "traffic_control", None)
+        if tc_cfg and tc_cfg.interfaces:
+            all_aliases = set(self.allocation.node_aliases.values())
+            all_nodes   = {n.name for n in self.config.nodes}
+            known = all_aliases | all_nodes
+            for iface in tc_cfg.interfaces:
+                node_part = iface.rsplit("-eth", 1)[0]
+                if node_part not in known:
+                    print(f"[WARN] traffic_control.{iface!r}: "
+                          f"node {node_part!r} not found in topology — "
+                          f"interface will be skipped. Check spelling or add to nodes:",
+                          flush=True)
 
         # ── STEP 3: build Mininet object ────────────────────────────────────
         print("[DBG-3] Building Mininet topology …", flush=True)
@@ -710,7 +746,7 @@ class ISPTopology:
 
         # ── STEP 10b: NPC manager ────────────────────────────────────────────
         if _NPC_AVAILABLE:
-            self._npc_manager = NPCManager(self.net, self.allocation, self.config.npc_hosts)
+            self._npc_manager = NPCManager(self.net, self.config, self.allocation, self.config.npc_hosts)
             print("[NPC] Ready. Use 'npc start [--intensity low|medium|high]' in CLI.", flush=True)
 
         # Wire NPC manager into capture manager (enables capture stop → npc stop)
@@ -747,17 +783,24 @@ class ISPTopology:
         yaml_files = sorted(config_dir.glob("topology*.yaml"))
 
         while True:
-            # Step 1: Attackers from all topologies; victims from current config only.
-            raw_attackers: list = list(getattr(self.config, "attackers", []))
-            for yaml_path in yaml_files:
-                try:
-                    cfg = load_config(str(yaml_path))
-                    raw_attackers.extend(cfg.attackers)
-                except Exception:
-                    continue
+            exfil_cfg = getattr(self.config, "exfiltration", None)
+            cfg_attacker = getattr(exfil_cfg, "attacker", None)
+
+            # Step 1: Build attacker pool — exfiltration.attacker takes precedence.
+            # attackers: list not required when exfiltration.attacker is set.
+            if cfg_attacker and cfg_attacker in self.net:
+                attackers = [cfg_attacker]
+            else:
+                raw_attackers: list = list(getattr(self.config, "attackers", []))
+                for yaml_path in yaml_files:
+                    try:
+                        cfg = load_config(str(yaml_path))
+                        raw_attackers.extend(cfg.attackers)
+                    except Exception:
+                        continue
+                attackers = [a for a in dict.fromkeys(raw_attackers) if a in self.net]
 
             # Step 2: Filter to hosts in current net; resolve victim IPs
-            attackers = [a for a in dict.fromkeys(raw_attackers) if a in self.net]
 
             victims = []
             seen_hosts: set = set()
@@ -792,31 +835,41 @@ class ISPTopology:
                 time.sleep(10)
                 continue
 
-            # Step 6: Random selection — attacker, victim, table
-            attacker_name = random.choice(attackers)
-            victim        = random.choice(filtered_victims)
-            table_name    = random.choice(victim["tables"])
+            # Step 6: Selection — exfil_cfg/cfg_attacker already resolved above
+            cfg_target    = getattr(exfil_cfg, "target_host", None)
+            cfg_endpoints = getattr(exfil_cfg, "endpoints", None) or []
+
+            attacker_name = attackers[0] if len(attackers) == 1 else random.choice(attackers)
+            victim = (
+                next((v for v in filtered_victims if v["host"] == cfg_target), None)
+                if cfg_target else None
+            ) or random.choice(filtered_victims)
+
+            if cfg_endpoints:
+                endpoint = random.choice(cfg_endpoints)
+            else:
+                endpoint = f"/api/{random.choice(victim['tables'])}"
+
+            # TOS from exfiltration config — attacker-side marking
+            tos = getattr(exfil_cfg, "attack_tos", 0x10)
 
             port = victim["port"]
             ip   = victim["ip"]
 
             print(
-                f"[exfil] {attacker_name} → {victim['host']}:{port}/{table_name}"
-                f"  ip={ip}",
+                f"[exfil] {attacker_name} → {victim['host']}:{port}{endpoint}"
+                f"  ip={ip}  tos={hex(tos)}",
                 flush=True,
             )
 
             node = self.net[attacker_name]
 
-            # Step 7: Run TOS-marked GET inside attacker's network namespace.
             proc = node.popen(
-                [sys.executable, "-c", _tos_exfil_script(ip, port, table_name)],
+                [sys.executable, "-c", _tos_exfil_script(ip, port, endpoint, tos)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
             proc.communicate()
-
-            # Step 8-9: Commands complete; end
             return True
 
     def apply_tc(self, seed: int = None) -> bool:

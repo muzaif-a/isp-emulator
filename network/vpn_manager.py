@@ -100,12 +100,13 @@ class VPNManager:
         if self.config.vpn_config.nat:
             vpn_net = self.config.settings.vpn_base_network
             lan_net = self.config.settings.lan_base_network
-            # Batch both NAT rules into one shell invocation
+            # Masquerade only for non-LAN destinations so VPN client IPs remain
+            # visible to hosts inside the LAN (e.g. db1 sees the attacker's VPN IP).
             gw_node.cmd(
-                f"iptables -t nat -A POSTROUTING -s {vpn_net} -j MASQUERADE 2>/dev/null; "
-                f"iptables -t nat -A POSTROUTING -s {lan_net} -j MASQUERADE 2>/dev/null"
+                f"iptables -t nat -A POSTROUTING -s {vpn_net} ! -d {lan_net} -j MASQUERADE 2>/dev/null; "
+                f"iptables -t nat -A POSTROUTING -s {lan_net} ! -d {lan_net} -j MASQUERADE 2>/dev/null"
             )
-            logger.info("VPN NAT/MASQUERADE enabled on %s", gw_name)
+            logger.info("VPN NAT/MASQUERADE enabled on %s (LAN excluded)", gw_name)
 
         gw_pubkey = self.wg.get_pubkey(gw_name)
         _t_gw = _time.perf_counter()
@@ -219,6 +220,12 @@ class VPNManager:
                     for other_subnet in self.allocation.lan_subnets.values():
                         route_subnets.append(str(other_subnet))
                 self.wg.add_ip_routes_batch(ci["node"], route_subnets)
+                # Real masquerade: replace LAN src IP with VPN IP for wg0 traffic.
+                # db1 then sees the VPN IP directly — no code-level substitution needed.
+                ci["node"].cmd(
+                    "iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null"
+                )
+                logger.info("Client MASQUERADE on wg0 enabled: %s", ci["name"])
             except Exception as exc:
                 logger.error("Client wiring failed for %s: %s", ci["name"], exc)
 

@@ -22,18 +22,6 @@ from services.service_registry import ServiceRegistry, ServiceInstance
 
 logger = logging.getLogger(__name__)
 
-# Ports to probe during auto-discovery
-_PROBE_PORTS = [
-    21,    # FTP
-    22,    # SSH
-    25,    # SMTP
-    53,    # DNS (UDP)
-    80,    # HTTP
-    443,   # HTTPS
-    7,     # Echo
-    8080, 8443, 8888, 9090, 9000, 9001,
-]
-
 # Banner fingerprints → service type
 _BANNERS = {
     b"220":      "smtp",
@@ -156,8 +144,6 @@ class ServiceDiscovery:
         mapping = {
             21: "ftp", 22: "ssh", 25: "smtp", 53: "dns",
             80: "http", 443: "https", 7: "echo",
-            8080: "http", 8443: "https",
-            9090: "sqlite", 9000: "custom_tcp", 9001: "custom_udp",
         }
         return mapping.get(port)
 

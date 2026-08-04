@@ -61,8 +61,15 @@ vpn:
   mode: remote_access
   nat: true
 
-attackers:
-  - h2
+exfiltration:
+  attacker: h2
+  target:
+    host: h3
+    port: 9090
+  endpoints:
+    - /api/users
+    - /api/sessions
+  attack_tos: 0x10
 
 # ── Services (victim h3) ──────────────────────────────────────────────────────
 services:
@@ -78,7 +85,7 @@ databases:
     api_port: 9090
     timing_protocol:
       enabled: true
-      secret_key: example_key
+      secret_key: topology-victimdb-covert-key
     tables:
       - name: users
         rows: 50

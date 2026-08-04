@@ -164,6 +164,7 @@ class VPNController:
             parts.append(f"ip route del {s} 2>/dev/null")
         for s in lan_subnets:
             parts.append(f"ip route del {s} dev wg0 2>/dev/null")
+        parts.append("iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null")
         compound = "; ".join(parts) + "; true"
 
         # All participants are on independent Mininet nodes (different shells),

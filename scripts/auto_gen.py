@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
+import re
 import subprocess
 import sys
 import time
@@ -87,6 +87,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _ROOT        = _SCRIPTS_DIR.parent
 
 _PROGRESS_FILE = _ROOT / ".auto_gen_progress.json"
+_SCHEMA_FILE   = _ROOT / "dataset" / "schema.json"
 
 # Mininet CLI prompt — matched as a literal string via expect_exact()
 _CLI_PROMPT = "mininet> "
@@ -112,7 +113,6 @@ class ExperimentConfig:
     npc:        list[str]
     inject:     list[str]
     exfil:      list[str]
-    wait:       list[str]   # Cartesian values: ["10"] | ["10","20"] | ["random:10-20"]
 
     @property
     def total_runs(self) -> int:
@@ -122,7 +122,6 @@ class ExperimentConfig:
             * len(self.npc)
             * len(self.inject)
             * len(self.exfil)
-            * len(self.wait)
             * self.repeat
         )
 
@@ -141,7 +140,6 @@ class Combo:
     npc:      str
     inject:   str
     exfil:    str
-    wait:     str   # "10" | "random:10-20" — an element of ExperimentConfig.wait
     run:      int   # 1-indexed within this combo's repeat block
 
     def key(self) -> str:
@@ -158,8 +156,7 @@ class Combo:
         topo = Path(self.topology).stem
         return (
             f"topo={topo:<30} vpn={self.vpn:<4} npc={self.npc:<7} "
-            f"inject={self.inject:<4} exfil={self.exfil:<6} "
-            f"wait={self.wait:<15} run={self.run}"
+            f"inject={self.inject:<4} exfil={self.exfil:<4} run={self.run}"
         )
 
 
@@ -195,111 +192,6 @@ def _require_str_list(data: dict, key: str) -> list[str]:
     return [str(v) for v in val]
 
 
-def _parse_wait(data: dict) -> list[str]:
-    """Parse the 'wait' field from YAML into a list of wait labels.
-
-    Two formats are supported:
-
-    Cartesian list — each value is a separate experiment dimension.
-    Experiments are generated for every value, like vpn or npc:
-
-        wait: [10]             ->  ["10"]          (one wait condition: 10 s)
-        wait: [10, 20]         ->  ["10", "20"]    (two conditions: 10 s and 20 s)
-        wait: [10, 30, 60]     ->  ["10", "30", "60"]
-
-    Structured policy — a single execution policy applied to all combos.
-    Does not expand the Cartesian product; every combo uses the same policy:
-
-        Fixed (exact duration):
-            wait:
-              fixed: 10         ->  ["10"]
-            wait:
-              mode: fixed
-              value: 10         ->  ["10"]
-
-        Random (sample independently per experiment):
-            wait:
-              random:
-                min: 10
-                max: 20         ->  ["random:10-20"]
-            wait:
-              mode: random
-              min: 10
-              max: 20           ->  ["random:10-20"]
-
-    Random policies produce the same label in the Cartesian product and
-    progress key. The sampled value varies per experiment and is captured
-    in the capture metadata, not in the key.
-    """
-    raw = data.get("wait")
-    if raw is None:
-        raise ConfigError("'wait' is required")
-
-    # ── Cartesian list ────────────────────────────────────────────────────────
-    if isinstance(raw, list):
-        if not raw:
-            raise ConfigError("'wait' list must not be empty")
-        result = []
-        for v in raw:
-            if not isinstance(v, (int, float)) or float(v) < 0:
-                raise ConfigError(
-                    f"'wait' list values must be non-negative integers, got {v!r}"
-                )
-            result.append(str(int(v)))
-        return result
-
-    # ── Structured policy ─────────────────────────────────────────────────────
-    if isinstance(raw, dict):
-        mode = str(raw.get("mode", "")).lower()
-
-        # { fixed: N }
-        if "fixed" in raw and not isinstance(raw["fixed"], dict):
-            val = raw["fixed"]
-            if not isinstance(val, (int, float)) or float(val) < 0:
-                raise ConfigError(f"'wait.fixed' must be a non-negative number, got {val!r}")
-            return [str(int(val))]
-
-        # { mode: fixed, value: N }
-        if mode == "fixed":
-            val = raw.get("value")
-            if not isinstance(val, (int, float)) or float(val) < 0:
-                raise ConfigError(f"'wait.value' must be a non-negative number, got {val!r}")
-            return [str(int(val))]
-
-        # { random: { min: N, max: N } }
-        if "random" in raw and isinstance(raw["random"], dict):
-            rng = raw["random"]
-            lo, hi = rng.get("min"), rng.get("max")
-            if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
-                raise ConfigError("'wait.random.min' and 'wait.random.max' must be numbers")
-            lo, hi = int(lo), int(hi)
-            if lo > hi:
-                raise ConfigError(
-                    f"'wait.random.min' ({lo}) cannot exceed 'wait.random.max' ({hi})"
-                )
-            return [f"random:{lo}-{hi}"]
-
-        # { mode: random, min: N, max: N }
-        if mode == "random":
-            lo, hi = raw.get("min"), raw.get("max")
-            if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
-                raise ConfigError("'wait.min' and 'wait.max' must be numbers for random mode")
-            lo, hi = int(lo), int(hi)
-            if lo > hi:
-                raise ConfigError(
-                    f"'wait.min' ({lo}) cannot exceed 'wait.max' ({hi})"
-                )
-            return [f"random:{lo}-{hi}"]
-
-        raise ConfigError(
-            "'wait' dict must use one of: "
-            "{fixed: N}, {mode: fixed, value: N}, "
-            "{random: {min: N, max: N}}, {mode: random, min: N, max: N}"
-        )
-
-    raise ConfigError(f"'wait' must be a list or dict, got {type(raw).__name__}")
-
-
 def load_yaml_config(config_path: Path) -> ExperimentConfig:
     """Load and validate auto-gen.yaml. Raises ConfigError on violations."""
     if not config_path.exists():
@@ -326,14 +218,18 @@ def load_yaml_config(config_path: Path) -> ExperimentConfig:
     if not isinstance(repeat_raw, int) or repeat_raw < 1:
         raise ConfigError("'repeat' must be an integer >= 1")
 
+    exfil = _require_str_list(data, "exfil")
+    for v in exfil:
+        if v not in ("on", "off"):
+            raise ConfigError(f"'exfil' values must be 'on' or 'off', got {v!r}")
+
     return ExperimentConfig(
         topologies=topologies,
         repeat=repeat_raw,
         vpn=_require_str_list(data, "vpn"),
         npc=_require_str_list(data, "npc"),
         inject=_require_str_list(data, "inject"),
-        exfil=_require_str_list(data, "exfil"),
-        wait=_parse_wait(data),
+        exfil=exfil,
     )
 
 
@@ -353,8 +249,6 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   sudo python3 scripts/auto_gen.py
   sudo python3 scripts/auto_gen.py --repeat 5
-  sudo python3 scripts/auto_gen.py --fixed-time 15
-  sudo python3 scripts/auto_gen.py --min-time 10 --max-time 30
   sudo python3 scripts/auto_gen.py --dry-run
   sudo python3 scripts/auto_gen.py --resume
   sudo python3 scripts/auto_gen.py --config /path/to/other.yaml
@@ -366,63 +260,13 @@ Examples:
         metavar="FILE",
         help="Path to auto-gen.yaml (default: configs/auto-gen.yaml)",
     )
-    p.add_argument("--repeat",     type=int, metavar="N",
+    p.add_argument("--repeat",  type=int, metavar="N",
                    help="Override repeat count (>= 1)")
-    p.add_argument("--fixed-time", type=int, metavar="SEC",
-                   help="Override wait: single fixed duration (seconds)")
-    p.add_argument("--min-time",   type=int, metavar="SEC",
-                   help="Override wait: minimum for random range")
-    p.add_argument("--max-time",   type=int, metavar="SEC",
-                   help="Override wait: maximum for random range")
-    p.add_argument("--dry-run",    action="store_true",
+    p.add_argument("--dry-run", action="store_true",
                    help="Print plan and exit — no Mininet started")
-    p.add_argument("--resume",     action="store_true",
+    p.add_argument("--resume",  action="store_true",
                    help="Skip already-completed combos from a previous run")
     return p
-
-
-def _resolve_wait(args: argparse.Namespace, yaml_wait: list[str]) -> list[str]:
-    """Merge CLI wait overrides into yaml_wait. Returns a list[str] in all cases."""
-    has_fixed = args.fixed_time is not None
-    has_min   = args.min_time   is not None
-    has_max   = args.max_time   is not None
-
-    if not has_fixed and not has_min and not has_max:
-        return yaml_wait
-
-    if has_fixed and (has_min or has_max):
-        _warn(
-            "Cannot combine\n\n--fixed-time\n\nwith\n\n--min-time/--max-time.\n\n"
-            "Using auto-gen.yaml configuration."
-        )
-        return yaml_wait
-
-    if has_fixed:
-        if args.fixed_time < 0:
-            _warn("--fixed-time must be >= 0.\nUsing auto-gen.yaml configuration.")
-            return yaml_wait
-        return [str(args.fixed_time)]
-
-    if has_min and not has_max:
-        _warn(
-            "Incomplete random wait override.\n\n"
-            "--min-time requires --max-time.\n\n"
-            "Falling back to auto-gen.yaml configuration."
-        )
-        return yaml_wait
-
-    if has_max and not has_min:
-        _warn("--max-time requires --min-time.\n\nFalling back to auto-gen.yaml.")
-        return yaml_wait
-
-    if args.min_time > args.max_time:
-        _warn(
-            "Minimum wait cannot exceed maximum wait.\n\n"
-            "Using auto-gen.yaml configuration."
-        )
-        return yaml_wait
-
-    return [f"random:{args.min_time}-{args.max_time}"]
 
 
 def _resolve_repeat(args: argparse.Namespace, yaml_repeat: int) -> int:
@@ -443,24 +287,10 @@ def resolve_config(args: argparse.Namespace, yaml_cfg: ExperimentConfig) -> Expe
         npc=yaml_cfg.npc,
         inject=yaml_cfg.inject,
         exfil=yaml_cfg.exfil,
-        wait=_resolve_wait(args, yaml_cfg.wait),
     )
 
 
-# ──────────────────────────────────────────────────── summary ─────────────
-
-
-def _wait_display(wait_label: str) -> str:
-    """Human-readable label for a wait value."""
-    if wait_label.startswith("random:"):
-        _, rng = wait_label.split(":", 1)
-        lo, hi = rng.split("-")
-        return f"random({lo}-{hi})s"
-    return f"{wait_label}s"
-
-
 def print_summary(cfg: ExperimentConfig) -> None:
-    wait_display = ", ".join(_wait_display(w) for w in cfg.wait)
     border = "=" * 32
     print(f"\n{border}")
     print("Experiment Configuration")
@@ -473,7 +303,6 @@ def print_summary(cfg: ExperimentConfig) -> None:
     print(f"NPC        : {', '.join(cfg.npc)}")
     print(f"Inject     : {'/'.join(cfg.inject)}")
     print(f"Exfil      : {'/'.join(cfg.exfil)}")
-    print(f"Wait       : {wait_display}")
     print()
     print(f"Total Runs : {cfg.total_runs}")
     print(f"{border}\n")
@@ -492,12 +321,11 @@ def build_combos(cfg: ExperimentConfig) -> list[Combo]:
     """
     combos: list[Combo] = []
     for topo in cfg.topologies:
-        for vpn, npc, inject, exfil, wait, run in product(
+        for vpn, npc, inject, exfil, run in product(
             cfg.vpn,
             cfg.npc,
             cfg.inject,
             cfg.exfil,
-            cfg.wait,
             range(1, cfg.repeat + 1),
         ):
             combos.append(Combo(
@@ -506,7 +334,6 @@ def build_combos(cfg: ExperimentConfig) -> list[Combo]:
                 npc=npc,
                 inject=inject,
                 exfil=exfil,
-                wait=wait,
                 run=run,
             ))
     return combos
@@ -552,22 +379,6 @@ def _mn_cleanup() -> None:
         print(f"  WARNING: mn -c failed: {exc}", flush=True)
 
 
-# ──────────────────────────── wait execution ─────────────────────────────
-
-
-def _wait_duration(wait_label: str) -> int:
-    """Convert a wait label to a concrete sleep duration in seconds.
-
-    "10"            ->  10            (fixed Cartesian value)
-    "random:10-20"  ->  randint(10,20) (random policy — samples independently)
-    """
-    if wait_label.startswith("random:"):
-        _, rng = wait_label.split(":", 1)
-        lo, hi = map(int, rng.split("-"))
-        return random.randint(lo, hi)
-    return int(wait_label)
-
-
 # ──────────────────────────── pexpect experiment driver ───────────────────
 
 
@@ -596,9 +407,9 @@ def run_experiment(combo: Combo) -> bool:
             [sleep _NPC_WARMUP_S]
             capture start
             [sleep _PRE_ACTION_S]
-            exfil             (exfil=true  — TOS-marked, label=1)
+            exfil on          — TOS-marked HTTP GET to DB (label=1)
             OR
-            sleep wait_s      (exfil=false — baseline, label=0)
+            exfil off         — plain HTTP GET to DB     (label=0)
             capture stop      (triggers merge + CSV pipeline if automatic: true)
             npc stop
             exit
@@ -651,13 +462,8 @@ def run_experiment(combo: Combo) -> bool:
         print(f"  [pre-action] {_PRE_ACTION_S}s ...", flush=True)
         time.sleep(_PRE_ACTION_S)
 
-        # ── 6. Exfil (label=1) or baseline wait (label=0) ─────────────────────
-        if combo.exfil == "true":
-            _cmd(child, "exfil", timeout=_EXFIL_TIMEOUT_S)
-        else:
-            wait_s = _wait_duration(combo.wait)
-            print(f"  [baseline] {wait_s}s ...", flush=True)
-            time.sleep(wait_s)
+        # ── 6. Exfil on=TOS-marked (label=1), off=plain (label=0) ───────────────
+        _cmd(child, f"exfil {combo.exfil}", timeout=_EXFIL_TIMEOUT_S)
 
         # ── 7. Stop capture — triggers merge + CSV pipeline ───────────────────
         # capture stop internally calls npc_manager.stop() (capture_manager.py:183)
@@ -699,6 +505,50 @@ def run_experiment(combo: Combo) -> bool:
             except Exception:
                 pass
         _mn_cleanup()
+
+
+# ─────────────────────────── schema annotation ───────────────────────────────
+
+
+def _annotate_latest_schema_entry(combo: Combo) -> None:
+    """Stamp the newest schema.json entry with the full experiment combo.
+
+    Experiments run sequentially (one at a time), so the last entry is always
+    the one written by the experiment that just completed.
+
+    Fields written under 'experiment' cover ALL combos — including sessions
+    where timing_protocol is empty (inject=off) which carry no other record
+    of the vpn/npc/inject/exfil settings used.
+    """
+    if not _SCHEMA_FILE.exists():
+        print("  WARNING: schema.json not found — combo not annotated.", flush=True)
+        return
+    try:
+        with _SCHEMA_FILE.open("r", encoding="utf-8") as fh:
+            records = json.load(fh)
+        if not isinstance(records, list) or not records:
+            return
+        last = records[-1]
+        if not isinstance(last, dict):
+            return
+        last["experiment"] = {
+            "vpn":    combo.vpn,
+            "npc":    combo.npc,
+            "inject": combo.inject,
+            "exfil":  combo.exfil,
+            "run":    combo.run,
+        }
+        raw = json.dumps(records, indent=2)
+        compacted = re.sub(
+            r'"rhythm":\s*(\[[^\]]*\])',
+            lambda m: '"rhythm": [' + ",".join(re.findall(r"\d+", m.group(1))) + "]",
+            raw,
+            flags=re.DOTALL,
+        )
+        with _SCHEMA_FILE.open("w", encoding="utf-8") as fh:
+            fh.write(compacted)
+    except Exception as exc:
+        print(f"  WARNING: schema annotation failed: {exc}", flush=True)
 
 
 # ──────────────────────────────────────────────────────────── main ────────────
@@ -753,6 +603,7 @@ def main() -> None:
         success = run_experiment(combo)
 
         if success:
+            _annotate_latest_schema_entry(combo)
             grand_ok += 1
             done.add(combo.key())
             save_progress(done)

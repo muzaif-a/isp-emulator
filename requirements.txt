@@ -1,6 +1,16 @@
-PyYAML>=6.0
-networkx>=3.0
-mininet>=2.3.0
-pexpect>=4.8
-pytest>=7.0
-pytest-timeout>=2.0
+# ISP Emulator — Python dependencies
+# Install with: pip3 install -r requirements.txt
+#
+# System packages (installed by scripts/setup.sh via apt-get, NOT pip):
+#   mininet, openvswitch-switch, wireguard, wireguard-tools,
+#   iproute2, iptables, tcpdump, wireshark-common, mergecap, curl
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+PyYAML>=6.0          # YAML config loading (config_loader.py, auto_gen.py)
+scapy>=2.5.0         # Packet capture, sniffing, PCAP writing (capture_manager.py,
+                     # database_manager.py TOS sniffer, featureapi.py, pcapng_reader.py)
+pexpect>=4.8         # PTY-based CLI driver for Mininet subprocess (auto_gen.py)
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.0          # Test runner (tests/)
+pytest-timeout>=2.0  # Per-test timeout guards

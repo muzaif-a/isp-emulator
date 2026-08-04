@@ -29,6 +29,7 @@ Components
 """
 
 import glob
+
 import json
 import logging
 import os
@@ -45,10 +46,12 @@ if TYPE_CHECKING:
 
 from config_loader import CaptureConfig, TopologyConfig
 from .ip_allocator import AllocationResult
+from errors import EmulatorError
 
 logger = logging.getLogger(__name__)
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SENTINEL = object()  # distinct from None — means "snapshot not yet taken"
 
 
 class CaptureManager:
@@ -82,6 +85,7 @@ class CaptureManager:
         self._npc_manager = None          # set via set_npc_manager()
         self._vpn_controller = None       # set via set_vpn_controller()
         self._tc_commands: Dict[str, str] = {}
+        self._npc_intensity_snapshot = _SENTINEL  # reset each stop()
 
         # Ensure required directories exist
         self._ensure_dirs()
@@ -134,9 +138,8 @@ class CaptureManager:
 
         interfaces = self._discover_interfaces()
         if not interfaces:
-            raise RuntimeError(
-                "CaptureManager: no interfaces found — check 'devices' in YAML."
-            )
+            raise EmulatorError("E017",
+                "no interfaces found — check capture.devices matches node names in topology")
 
         self._sniffers = {}
         for device_name, iface in interfaces:
@@ -179,6 +182,11 @@ class CaptureManager:
 
         self._running = False
         time.sleep(0.5)  # allow subprocesses to flush and write
+
+        # Snapshot NPC intensity before stopping — _resolve_npc_intensity() checks
+        # is_running(), so intensity must be captured while NPC threads are live.
+        self._npc_intensity_snapshot = _SENTINEL   # clear any previous session snapshot
+        self._npc_intensity_snapshot = self._resolve_npc_intensity()
 
         # Stop NPC background traffic
         if self._npc_manager and self._npc_manager.is_running():
@@ -445,10 +453,10 @@ class CaptureManager:
         return os.path.join(_ROOT, self.cfg.merged, f"{session_id}.pcapng")
 
     def _schema_path(self) -> str:
-        return os.path.join(_ROOT, "dataset", "schema.json")
+        return os.path.join(_ROOT, self.cfg.schema_file)
 
     def _network_profile_path(self) -> str:
-        return os.path.join(_ROOT, "dataset", "network_profile.json")
+        return os.path.join(_ROOT, self.cfg.network_profile_file)
 
     def _write_network_profile(self, session_id: str, commands: Dict[str, str]) -> None:
         """Append or update {session_id: {device: tc_cmd}} in dataset/network_profile.json."""
@@ -491,10 +499,7 @@ class CaptureManager:
     def _discover_interfaces(self) -> List[Tuple[str, str]]:
         result: List[Tuple[str, str]] = []
         if not self.cfg.devices:
-            raise ValueError(
-                "CaptureManager: 'devices' list is empty — add device names to "
-                "capture.devices in YAML."
-            )
+            raise EmulatorError("E017", "capture.devices is empty — add node names")
         for device_name in self.cfg.devices:
             try:
                 node = self.net[device_name]
@@ -519,11 +524,18 @@ class CaptureManager:
             print(f"[CAPTURE] Feature selector not found: {endpoint}", flush=True)
             return None
         try:
+            # Resolve ATTACK_TOS from exfiltration config — attacker-side marking.
+            # featureapi.get_is_attack() must use the same byte as the exfil script.
+            exfil_cfg = getattr(self.config, "exfiltration", None)
+            attack_tos = hex(int(getattr(exfil_cfg, "attack_tos", 0x10)))
+            env = {**os.environ, "ATTACK_TOS": attack_tos}
+
             proc = subprocess.Popen(
                 [sys.executable, endpoint, pcapng_path, session_id, self._yaml_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
             )
             stdout_data, stderr_data = proc.communicate(timeout=300)
 
@@ -579,98 +591,55 @@ class CaptureManager:
             print(f"[CAPTURE] Parser exception: {exc}", flush=True)
             return None
 
-    def _build_runtime_metadata(self) -> List[Dict]:
-        """Return timing_protocol list — one entry per TOS-marked attacker request."""
+    def _build_runtime_metadata(self) -> Dict:
+        """Return timing_protocol object for this session.
+
+        enabled/vpn/intensity are NOT included — they live in experiment (written
+        by auto_gen.py) so there is no duplication. Every session gets one object:
+        nulls for baseline runs, observed values for exfil runs. One session always
+        produces exactly one timing protocol call.
+        """
         sessions = self._load_timing_protocol_sessions()
 
         db_cfg = self._primary_database_with_api()
+        tp_cfg = getattr(db_cfg, "timing_protocol", None) if db_cfg else None
+        cfg_short_ms    = float(getattr(tp_cfg, "short_delay_ms", None) or 20.0)
+        cfg_long_ms     = float(getattr(tp_cfg, "long_delay_ms",  None) or 50.0)
+        cfg_key_present = bool(getattr(tp_cfg, "secret_key", None)) if tp_cfg else False
+
+        if not sessions:
+            return {
+                "src":                      None,
+                "dest":                     None,
+                "secret_key_present":       cfg_key_present,
+                "start_timestamp":          None,
+                "end_timestamp":            None,
+                "nonces_used":              [],
+                "exfiltrated_data_packets": None,
+                "rhythm":                   [],
+                "short_delay_ms":           cfg_short_ms,
+                "long_delay_ms":            cfg_long_ms,
+            }
+
         db_ip = self.allocation.get_host_ip(db_cfg.host) if db_cfg else None
         db_port = db_cfg.api_port if db_cfg else None
-        fallback_dest = f"{db_ip}:{db_port}" if db_ip and db_port else "127.0.0.1:9090"
+        fallback_dest = f"{db_ip}:{db_port}" if db_ip and db_port else None
 
-        npc_intensity = self._resolve_npc_intensity()
-
-        vpn_active = False
-        if self._vpn_controller is not None:
-            try:
-                vpn_active = bool(self._vpn_controller.is_active())
-            except Exception:
-                vpn_active = False
-
-        result = []
-        for s in sessions:
-            raw_src = s.get("src") or "127.0.0.1"
-            if vpn_active:
-                src = self._vpn_ip_for_lan_src(raw_src) or raw_src
-            else:
-                src = raw_src
-            _ep = s.get("exfiltrated_data_packets")
-            result.append({
-                "enabled":                    bool(s.get("enabled", False)),
-                "vpn":                        vpn_active,
-                "intensity":                  npc_intensity,
-                "src":                        src,
-                "dest":                       s.get("dest") or fallback_dest,
-                "secret_key":                 s.get("secret_key"),
-                "start_timestamp":            s.get("start_timestamp")
-                                              or s.get("timestamp"),
-                "end_timestamp":              s.get("end_timestamp"),
-                "nonces_used":                s.get("nonces_used") or [],
-                "exfiltrated_data_packets":   _ep if _ep is not None
-                                              else s.get("total_data_packets"),
-                "rhythm":                     s.get("rhythm") or [],
-                "short_delay_ms":             float(s.get("short_delay_ms") or 20.0),
-                "long_delay_ms":              float(s.get("long_delay_ms")  or 50.0),
-            })
-        return result
-
-    def _vpn_ip_for_lan_src(self, lan_ip: str) -> Optional[str]:
-        """Map a LAN src IP (192.x.x.x) to its VPN representation (172.x.x.x).
-
-        For remote_access VPN: attacker node has its own VPN IP — return that.
-        For site_to_site VPN: attacker is behind a gateway router — return the
-        gateway's WireGuard IP so VPN sessions show 172.x.x.x in schema.json.
-        """
-        try:
-            alloc = self.allocation
-            # Reverse-map LAN IP → node name
-            attacker_node = None
-            for node_name, ifaces in alloc.node_interfaces.items():
-                for ip, _prefix in ifaces.values():
-                    if ip == lan_ip:
-                        attacker_node = node_name
-                        break
-                if attacker_node:
-                    break
-            if not attacker_node:
-                return None
-
-            # Direct VPN client (remote_access mode — node has own WG IP)
-            vpn_ip = alloc.vpn_node_ips.get(attacker_node)
-            if vpn_ip:
-                return str(vpn_ip)
-
-            # Site-to-site: find gateway for this host's LAN subnet
-            gw_ip = alloc.default_gateways.get(attacker_node)
-            if not gw_ip:
-                return None
-
-            # Reverse-map gateway IP → gateway node name
-            gw_node = None
-            for node_name, ifaces in alloc.node_interfaces.items():
-                for ip, _prefix in ifaces.values():
-                    if ip == str(gw_ip):
-                        gw_node = node_name
-                        break
-                if gw_node:
-                    break
-            if not gw_node:
-                return None
-
-            gw_vpn_ip = alloc.vpn_node_ips.get(gw_node)
-            return str(gw_vpn_ip) if gw_vpn_ip else None
-        except Exception:
-            return None
+        s = sessions[0]
+        _ep = s.get("exfiltrated_data_packets")
+        return {
+            "src":                      s.get("src"),
+            "dest":                     s.get("dest") or fallback_dest,
+            "secret_key_present":       bool(s.get("secret_key")),
+            "start_timestamp":          s.get("start_timestamp") or s.get("timestamp"),
+            "end_timestamp":            s.get("end_timestamp"),
+            "nonces_used":              s.get("nonces_used") or [],
+            "exfiltrated_data_packets": _ep if _ep is not None
+                                        else s.get("total_data_packets"),
+            "rhythm":                   s.get("rhythm") or [],
+            "short_delay_ms":           float(s.get("short_delay_ms") or cfg_short_ms),
+            "long_delay_ms":            float(s.get("long_delay_ms")  or cfg_long_ms),
+        }
 
     def _load_timing_protocol_sessions(self) -> List[Dict]:
         """Read timing metadata file. Returns list — one dict per attacker request."""
@@ -680,14 +649,6 @@ class CaptureManager:
 
         meta_path = f"/tmp/timing_{db_cfg.host}_{db_cfg.name}.json"
         if not os.path.exists(meta_path):
-            tp = getattr(db_cfg, "timing_protocol", None)
-            if tp and tp.enabled:
-                return [{
-                    "enabled": True, "secret_key": "example_key",
-                    "timestamp": None, "nonces_used": [],
-                    "total_data_packets": None, "rhythm": [],
-                    "src": None, "dest": None,
-                }]
             return []
 
         try:
@@ -702,17 +663,25 @@ class CaptureManager:
             logger.warning("[CAPTURE] Failed reading timing metadata %s: %s", meta_path, exc)
             return []
 
-    def _resolve_npc_intensity(self) -> str:
-        """Return NPC intensity for this session. Global > per-host majority > 'medium'."""
-        if not self._npc_manager:
-            return "medium"
+    def _resolve_npc_intensity(self) -> Optional[str]:
+        """Return actual running NPC intensity, or None if NPC never started.
+
+        Returns snapshot if already captured (called after npc.stop()).
+        Otherwise reads live from running manager.
+        If NPC was not started this session, returns None.
+        """
+        snapshot = getattr(self, "_npc_intensity_snapshot", _SENTINEL)
+        if snapshot is not _SENTINEL:
+            return snapshot
+        if not self._npc_manager or not self._npc_manager.is_running():
+            return None
         intensity = getattr(self._npc_manager, "_intensity", None)
         if not intensity:
             host_map = getattr(self._npc_manager, "_host_intensity", {})
             vals = list(host_map.values())
             if vals:
                 intensity = max(set(vals), key=vals.count)
-        return intensity or "medium"
+        return intensity or None
 
     def _primary_database_with_api(self):
         for db_cfg in getattr(self.config, "databases", []):
@@ -723,7 +692,7 @@ class CaptureManager:
     def _append_schema_record(
         self,
         session_id: str,
-        timing_protocol: List[Dict],
+        timing_protocol: Dict,
         url: Optional[Dict] = None,
     ) -> None:
         """Append or update a session entry in dataset/schema.json.
@@ -733,8 +702,9 @@ class CaptureManager:
 
         Args:
             session_id: unique session identifier.
-            timing_protocol: list of timing protocol entry dicts (each self-contained
-                             with src, dest, enabled, rhythm, etc.).
+            timing_protocol: timing protocol object (src, dest, rhythm, etc.).
+                             enabled/vpn/intensity are omitted — they live in
+                             the experiment object written by auto_gen.py.
             url: dict of {folder_path: mime_type} entries, e.g.
                  {"dataset/pcapng": "text/pcapng"}.
                  Defaults to {cfg.merged: "text/pcapng"}.

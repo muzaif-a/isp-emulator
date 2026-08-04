@@ -52,9 +52,15 @@ vpn:
     - h2
     - h4
 
-attackers:
-  - h2
-  - h4
+exfiltration:
+  attacker: h2
+  target:
+    host: db1
+    port: 9090
+  endpoints:
+    - /api/employees
+    - /api/products
+  attack_tos: 0x10
 
 # ── ISP infrastructure ─────────────────────────────────────────────────────
 nodes:
@@ -166,7 +172,7 @@ databases:
     api_port: 9090 
     timing_protocol:
       enabled: true
-      secret_key: example_key
+      secret_key: enterprise-company-covert-key
       short_delay_ms: 20    # bit=0 inter-packet delay — change for Tor/ISP modes
       long_delay_ms: 50     # bit=1 inter-packet delay — must satisfy: long - short >> max_jitter
     tables:

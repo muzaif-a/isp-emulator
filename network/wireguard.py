@@ -10,9 +10,13 @@ Supports any topology role: gateway, client, or peer-to-peer.
 import logging
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, TYPE_CHECKING
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from errors import EmulatorError
 
 if TYPE_CHECKING:
     from mininet.node import Node
@@ -249,11 +253,11 @@ class WireGuardManager:
                 capture_output=True, text=True, check=True
             ).stdout.strip()
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            raise RuntimeError(f"WireGuard key generation failed: {exc}") from exc
+            raise EmulatorError("R020", f"{exc}") from exc
         if not privkey or len(privkey) < 40:
-            raise RuntimeError(f"wg genkey returned invalid key: {privkey!r}")
+            raise EmulatorError("R020", f"wg genkey returned invalid key: {privkey!r}")
         if not pubkey or len(pubkey) < 40:
-            raise RuntimeError("wg pubkey derivation returned invalid key")
+            raise EmulatorError("R020", "wg pubkey derivation returned invalid key")
         return privkey, pubkey
 
     @staticmethod

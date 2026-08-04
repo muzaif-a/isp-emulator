@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 DB = sys.argv[1] if len(sys.argv) > 1 else '/tmp/db.sqlite'
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
 TIMING_ENABLED = str(sys.argv[3]).strip().lower() in ('1', 'true', 'yes', 'on') if len(sys.argv) > 3 else False
-TIMING_SECRET = sys.argv[4] if len(sys.argv) > 4 else 'example_key'
+TIMING_SECRET = sys.argv[4] if len(sys.argv) > 4 else None
 TIMING_META_PATH = sys.argv[5] if len(sys.argv) > 5 else '/tmp/timing_metadata.json'
 TIMING_SHORT_MS = float(sys.argv[6]) if len(sys.argv) > 6 else 20.0
 TIMING_LONG_MS  = float(sys.argv[7]) if len(sys.argv) > 7 else 50.0
@@ -47,13 +47,13 @@ TIMING_LONG_MS  = float(sys.argv[7]) if len(sys.argv) > 7 else 50.0
 
 import threading as _threading
 
-ATTACK_TOS   = 0x10
+ATTACK_TOS   = int(sys.argv[8], 0) if len(sys.argv) > 8 else 0x10
 TIMING_ARMED = TIMING_ENABLED
 TIMING_GATE  = TIMING_ENABLED   # runtime toggle — POST /timing/set {"enabled": false}
 
 
 class TimingProtocol:
-    def __init__(self, secret_key='example_key', short_delay_ms=20.0, long_delay_ms=50.0):
+    def __init__(self, secret_key=None, short_delay_ms=20.0, long_delay_ms=50.0):
         self.secret_key = secret_key
         self.short_delay_s = short_delay_ms / 1000.0
         self.long_delay_s  = long_delay_ms  / 1000.0
@@ -157,7 +157,7 @@ class TimingProtocol:
         with self._lock:
             if not self._pool:
                 digest = hashlib.sha512(
-                    f'{self.secret_key}:{self._nonce}'.encode('utf-8')
+                    f'{self.secret_key}:{self.start_timestamp}:{self._nonce}'.encode('utf-8')
                 ).digest()
                 bits = []
                 for byte in digest:
@@ -447,9 +447,10 @@ class DatabaseManager:
         config: TopologyConfig,
     ) -> None:
         """Create and populate all databases declared in the config."""
+        exfil_cfg = getattr(config, "exfiltration", None)
         for db_cfg in config.databases:
             try:
-                self._deploy_one(net, db_cfg)
+                self._deploy_one(net, db_cfg, exfil_cfg=exfil_cfg)
             except Exception as exc:
                 logger.error("DB deploy failed for %s@%s: %s", db_cfg.name, db_cfg.host, exc)
 
@@ -481,7 +482,7 @@ class DatabaseManager:
 
     # --------------------------------------------------------------- internals
 
-    def _deploy_one(self, net, db_cfg: DatabaseConfig) -> None:
+    def _deploy_one(self, net, db_cfg: DatabaseConfig, exfil_cfg=None) -> None:
         """Build database on host, optionally start CRUD API."""
         db_path = f"/tmp/{db_cfg.host}_{db_cfg.name}.db"
         logger.info("Creating DB %s on %s → %s", db_cfg.name, db_cfg.host, db_path)
@@ -510,9 +511,10 @@ class DatabaseManager:
 
         # Start CRUD API if port configured
         if db_cfg.api_port:
-            self._start_api(net, db_cfg, db_path)
+            self._start_api(net, db_cfg, db_path, exfil_cfg=exfil_cfg)
 
-    def _start_api(self, net, db_cfg: DatabaseConfig, db_path: str) -> None:
+    def _start_api(self, net, db_cfg: DatabaseConfig, db_path: str,
+                   exfil_cfg=None) -> None:
         """Write API server script and run it on the target host."""
         script_path = f"/tmp/api_{db_cfg.host}_{db_cfg.name}.py"
         with open(script_path, "w") as fh:
@@ -522,14 +524,21 @@ class DatabaseManager:
         node = net[db_cfg.host]
         tp = getattr(db_cfg, "timing_protocol", None)
         timing_enabled   = bool(getattr(tp, "enabled",        False))
-        timing_secret    = getattr(tp, "secret_key",   "example_key")
+        timing_secret    = getattr(tp, "secret_key",   None)
+        if timing_enabled and not timing_secret:
+            import sys as _sys; _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+            from errors import EmulatorError
+            raise EmulatorError("R101",
+                f"db '{db_cfg.name}' on {db_cfg.host} — set secret_key in timing_protocol:")
         timing_short_ms  = float(getattr(tp, "short_delay_ms", 20.0))
         timing_long_ms   = float(getattr(tp, "long_delay_ms",  50.0))
+        # attack_tos is attacker behavior — read from exfiltration config
+        timing_tos       = hex(int(getattr(exfil_cfg, "attack_tos", 0x10)))
         timing_meta = f"/tmp/timing_{db_cfg.host}_{db_cfg.name}.json"
         node.cmd(
             f"python3 {script_path} {db_path} {db_cfg.api_port} "
             f"{1 if timing_enabled else 0} {timing_secret} {timing_meta} "
-            f"{timing_short_ms} {timing_long_ms} "
+            f"{timing_short_ms} {timing_long_ms} {timing_tos} "
             f"> /tmp/api_{db_cfg.host}_{db_cfg.name}.log 2>&1 &"
         )
         time.sleep(0.5)

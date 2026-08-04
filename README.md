@@ -22,8 +22,9 @@ For usage, configuration syntax, and CLI commands, see [Guide.md](Guide.md).
 12. [Exfiltration Subsystem](#12-exfiltration-subsystem)
 13. [Session Registry — schema.json](#13-session-registry--schemajson)
 14. [Configuration System](#14-configuration-system)
-15. [Automation Runner](#15-automation-runner)
-16. [Data Flow](#16-data-flow)
+15. [Error System](#15-error-system-errorspy)
+16. [Automation Runner](#16-automation-runner)
+17. [Data Flow](#16-data-flow)
 18. [Design Philosophy](#18-design-philosophy)
 19. [Development Workflow](#19-development-workflow)
 20. [Contribution Guide](#20-contribution-guide)
@@ -49,16 +50,25 @@ The emulator builds a virtual network using Mininet with Open vSwitch (OVS) swit
 ## 2. Quick Start
 
 ```bash
-# Install system dependencies
+# Install all system and Python dependencies (Ubuntu 22.04)
 sudo bash scripts/setup.sh
 
-# Run a topology interactively (requires root)
+# Clean any stale Mininet state
 sudo mn -c
+
+# Run a topology interactively (requires root)
 sudo python3 network/topology.py configs/topology_enterprise.yaml --cli
 
 # Run automated experiment generation (requires root)
 sudo python3 scripts/auto_gen.py --config configs/auto-gen.yaml
+
+# Run unit/physics tests (no root needed)
+python3 -m pytest tests/ -q
 ```
+
+**System packages installed by `setup.sh`:** `mininet`, `openvswitch-switch`, `wireguard`, `wireguard-tools`, `iproute2` (`tc`), `iptables`, `tcpdump`, `wireshark-common` (`mergecap`), `iperf3`, `dnsutils` (`dig`), `curl`
+
+**Python packages (`requirements.txt`):** `PyYAML`, `scapy`, `pexpect`, `pytest`, `pytest-timeout`
 
 ---
 
@@ -67,6 +77,8 @@ sudo python3 scripts/auto_gen.py --config configs/auto-gen.yaml
 ```
 isp-emulator/
 ├── config_loader.py              YAML → typed dataclasses
+├── errors.py                     Structured error codes (E000–R101) with inline fix hints
+├── mechanism.md                  Physics formulas: TBF+netem, NPC traffic, timing protocol
 ├── debug.py                      Coloured console output
 ├── requirements.txt              Python package dependencies
 │
@@ -236,7 +248,10 @@ Deploys hub-and-spoke WireGuard. Optimised for parallelism — stages 2 and 4 ru
 - `remote_access`: client allowed-IPs = `{client_vpn_ip}/32`. All LAN subnets route via gateway.
 - `hybrid`: `peers` get site-to-site; `clients` get remote-access.
 
-**NAT:** if `vpn.nat: true`, `iptables MASQUERADE` applied at gateway for VPN and LAN ranges.
+**NAT:** if `vpn.nat: true`:
+- Each VPN client node gets `iptables MASQUERADE -o wg0` — outbound traffic via wg0 uses the VPN IP as source.
+- Gateway masquerades only non-LAN traffic (`! -d lan_base_network`) — LAN destinations see the real VPN IP, enabling per-session VPN detection from packet evidence.
+- Cleanup: wg0 masquerade rule removed on `vpn off`.
 
 ### VPN Controller (`network/vpn_controller.py`)
 
@@ -289,11 +304,13 @@ For each `DatabaseConfig`:
 
 Deterministic covert timing channel.
 
-**Mechanism:** SHA-512(key:nonce) generates a 512-bit pool. Each bit: 0 → sleep `short_delay_ms`; 1 → sleep `long_delay_ms`. On pool exhaustion, nonce increments and a new pool is generated.
+**Mechanism:** `SHA-512(secret_key:start_timestamp:nonce)` generates a 512-bit pool. `start_timestamp` is the Unix timestamp of the first TOS-marked packet — acts as a session-unique salt so keystreams from the same key differ per session. Each bit: 0 → sleep `short_delay_ms`; 1 → sleep `long_delay_ms`. On pool exhaustion, nonce increments and a new digest is computed.
 
 **Metadata accumulated per request:** rhythm (bit sequence), nonces used, packet count, start/end timestamps, src/dest IPs.
 
-**Detection:** observer measures inter-packet delays (IPDs). IPDs ≈ `short_delay_ms` → bit=0; IPDs ≈ `long_delay_ms` → bit=1. Decoded bitstream matches SHA-512(key:1) if key is known.
+**Detection:** observer measures inter-packet delays (IPDs). IPDs ≈ `short_delay_ms` → bit=0; IPDs ≈ `long_delay_ms` → bit=1. Decoded bitstream matches `SHA-512(key:t0:1)` given known key and recorded `start_timestamp`.
+
+See `mechanism.md §15` for full formulas and signal-to-noise analysis.
 
 State file: `/tmp/timing_{host}_{db}.json`. Read by `CaptureManager` at `capture stop` to populate `schema.json`.
 
@@ -321,14 +338,16 @@ Pure Python, no external dependencies. `generate(field_type, context)` returns a
 
 | Behavior | Implementation | Inter-arrival |
 |----------|---------------|---------------|
-| `http` | `curl GET http://web1:8080/` | expovariate(1/5) |
-| `dns` | `dig @dns1 {domain}` | expovariate(1/4) |
-| `db_query` | `curl GET http://db1:9090/api/{endpoint}` | expovariate(1/3) |
+| `http` | `curl GET http://{http_node_ip}:{port}/` | expovariate(1/5) |
+| `dns` | `dig @{dns_node_ip} {nodename}.local` | expovariate(1/4) |
+| `db_query` | `curl GET http://{db_ip}:{port}/{endpoint}` | expovariate(1/3) |
 | `smtp` | Python `smtplib`, lognormal(8,3) KB body | uniform(5,15) |
 | `ftp` | Python `ftplib`, uniform(0.1,5) MB | uniform(8,20) |
 | `bulk` | `iperf3 -u -b {2-8}M -t 5` | expovariate(1/15) |
 | `echo` | Python TCP socket, uniform(8,512) B | expovariate(1/8) |
 | `idle` | no-op | expovariate(1/10) |
+
+Service IPs resolved at startup from `services:` and `databases:` sections by service type — no hardcoded node names. DNS query domains are `{nodename}.local` for every node in the topology. Behaviors are silently skipped if the required service type is absent from the YAML.
 
 NPC is automatically stopped when `capture stop` is called.
 
@@ -375,13 +394,17 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 
 ## 12. Exfiltration Subsystem
 
-**TOS marking:** attacker sends HTTP GET with `IP_TOS=0x10` applied at the socket level before `connect()`. Scoped to this socket only — concurrent NPC database traffic is never marked.
+**TOS marking:** attacker sends HTTP GET with `IP_TOS = exfiltration.attack_tos` applied at the socket level before `connect()` (default `0x10`). Scoped to this socket only — concurrent NPC database traffic is never marked.
 
-**Attacker discovery:** aggregates `attackers:` from all `configs/topology*.yaml` files. Filters to nodes present in current net.
+**Attacker selection:** if `exfiltration.attacker` is set in the YAML, that node is used directly — no `attackers:` list required. If not set, aggregates `attackers:` from all `configs/topology*.yaml` files and picks randomly.
 
-**Victim discovery:** from current config's `databases:` list only (avoids hostname collisions across topologies).
+**Victim discovery:** from current config's `databases:` list only (avoids hostname collisions across topologies). If `exfiltration.target.host` is set, that database is used directly.
 
-**Label:** `get_is_attack()` feature function returns `"1"` for TOS=0x10 packets — per-packet ground-truth labels in the CSV dataset.
+**Endpoint selection:** from `exfiltration.endpoints` if set; otherwise `/api/{table_name}` for a random table.
+
+**TOS byte:** from `exfiltration.attack_tos` in YAML (default `0x10`). Same value used by the server sniffer and `featureapi.get_is_attack()` via `ATTACK_TOS` env var.
+
+**Label:** `get_is_attack()` feature function returns `"1"` for packets matching `ATTACK_TOS` — per-packet ground-truth labels in the CSV dataset.
 
 ---
 
@@ -391,25 +414,24 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 
 ```json
 {
-  "session_id": "20260722_083000_123456",
+  "session_id": "20260724_004814_216934",
   "topology": "topology_enterprise.yaml",
   "url": {
-    "dataset/pcapng": "text/pcapng",
-    "dataset/csv": "text/csv"
+    "dataset/pcapng": "text/pcapng"
   },
   "timing_protocol": [
     {
       "enabled": true,
       "vpn": true,
-      "intensity": "medium",
-      "src": "172.16.0.1",
+      "intensity": "low",
+      "src": "172.16.0.2",
       "dest": "192.168.1.3:9090",
-      "secret_key": "example_key",
-      "start_timestamp": 1784599697.377,
-      "end_timestamp": 1784599697.563,
+      "secret_key": "enterprise-company-covert-key",
+      "start_timestamp": 1784834305.863,
+      "end_timestamp": 1784834308.893,
       "nonces_used": [1],
-      "exfiltrated_data_packets": 4,
-      "rhythm": [1,0,0],
+      "exfiltrated_data_packets": 81,
+      "rhythm": [1,1,0,0,1,0,1,1],
       "short_delay_ms": 20.0,
       "long_delay_ms": 50.0
     }
@@ -417,7 +439,19 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 }
 ```
 
-`timing_protocol` is an array — one entry per attacker request. Empty array for baseline (no exfil) captures.
+**Field sources — all real network evidence, nothing hardcoded:**
+
+| Field | Source |
+|-------|--------|
+| `src` | Actual `pkt[IP].src` from Scapy sniffer on db server |
+| `vpn` | `ipaddress(src) in vpn_subnet` — packet-level evidence |
+| `intensity` | `npc_manager.is_running()` + actual running intensity; `null` if NPC not started |
+| `secret_key` | From `databases[].timing_protocol.secret_key` in YAML |
+| `start_timestamp` | Real `pkt.time` from first TOS-marked packet |
+| `end_timestamp` | Real `time.time()` at last response chunk sent |
+| `rhythm` | Actual bits consumed from SHA-512 keystream |
+
+`timing_protocol` is an array — one entry per attacker TCP connection. Empty array for baseline captures.
 
 `rhythm` is serialised compact (no spaces inside `[]`).
 
@@ -432,10 +466,10 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 **Steps:**
 1. `yaml.safe_load()`.
 2. Parse Phase 1: `nodes`, `links`, `settings`, `vpn_peers`.
-3. Parse Phase 2: `lans`, `services`, `databases`, `deployment`, `security`, `vpn`, `routes`, `capture`, `device_classes`, `npc.hosts`, `exfiltration`, `traffic_control`, `attackers`.
+3. Parse Phase 2: `lans`, `services`, `databases`, `deployment`, `security`, `vpn`, `routes`, `capture`, `device_classes`, `npc.hosts`, `exfiltration`, `traffic_control`, `attackers` (optional).
 4. If `vpn.server.node` set: `_merge_vpn_config()` auto-populates `vpn_gateways` and `vpn_peers`.
 5. If `lans` declared: `_expand_lans()` creates nodes, links, gateways in-place.
-6. `_validate()` raises `ValueError` on structural violations.
+6. `_validate()` raises `EmulatorError` (from `errors.py`) on structural violations. Each error carries a code (E000–R101), the exact YAML key, an inline fix snippet, and a Guide.md §10 reference.
 
 **Key behaviours:**
 - `node:` and `host:` both accepted as service host key; `node:` takes precedence.
@@ -446,7 +480,33 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 
 ---
 
-## 15. Automation Runner
+## 15. Error System (`errors.py`)
+
+All configuration and runtime failures raise `EmulatorError` instead of bare Python exceptions. Each error prints:
+
+```
+──────────────────────────────────────────────────────────────
+  ISP Emulator  [E011]
+──────────────────────────────────────────────────────────────
+
+  Problem : timing_protocol is enabled but secret_key is not set.
+  Where   : db 'victimdb' on host h3
+
+  Fix     : Add a secret_key under timing_protocol::
+              timing_protocol:
+                enabled: true
+                secret_key: your-real-secret-here   ← add this line
+
+  YAML key: databases[].timing_protocol.secret_key
+  Guide   : Guide.md §3.7 databases → timing_protocol  →  E011
+──────────────────────────────────────────────────────────────
+```
+
+Error codes: **E000–E019** (config structure), **E021–E044** (enum/range validation), **R001–R020** (runtime IP/WireGuard), **R101** (service startup). Full list: `Guide.md §10 Error Codes`.
+
+---
+
+## 16. Automation Runner
 
 `scripts/auto_gen.py` — experiment isolation via pexpect.
 
@@ -558,7 +618,7 @@ sudo mn -c
 
 ## 20. Contribution Guide
 
-**New topology:** copy an existing YAML, modify, test with `sudo python3 network/topology.py configs/my_new.yaml --cli`. Ensure `_validate()` passes (raises `ValueError` on structural errors).
+**New topology:** copy an existing YAML, modify, test with `sudo python3 network/topology.py configs/my_new.yaml --cli`. `_validate()` raises `EmulatorError` with code + YAML key + inline fix on any structural violation. See `Guide.md §10` for all error codes.
 
 **New service type:** add deployment function in `services/service_manager.py`. Add type to `ServiceConfig.type` docs in `config_loader.py`.
 
@@ -584,4 +644,5 @@ sudo mn -c
 
 ---
 
-*For configuration syntax, CLI commands, and usage examples, see [Guide.md](Guide.md).*
+*For configuration syntax, CLI commands, and usage examples, see [Guide.md](Guide.md).*  
+*For physics formulas (TBF+netem, NPC traffic model, timing protocol), see [mechanism.md](mechanism.md).*

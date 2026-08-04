@@ -32,7 +32,7 @@ class TimingProtocol:
 	def __init__(
 		self,
 		enabled: bool = False,
-		secret_key: str = "example_key",
+		secret_key: Optional[str] = None,
 		short_delay_ms: float = 20.0,
 		long_delay_ms: float = 50.0,
 	) -> None:
@@ -73,7 +73,10 @@ class TimingProtocol:
 			return 0.0
 
 		if not self._bits_pool:
+<<<<<<< HEAD
 			# digest = hashlib.sha512(f"{self.secret_key}:{self._current_nonce}".encode("utf-8")).digest()
+=======
+>>>>>>> 0c1e099 (static routing and ip issue solved)
 			digest = hashlib.sha512(f"{self.secret_key}:{self.start_timestamp}:{self._current_nonce}".encode("utf-8")).digest()
 			bits: List[int] = []
 			for byte in digest:

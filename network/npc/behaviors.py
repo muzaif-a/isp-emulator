@@ -31,9 +31,10 @@ def http(node, web1_ip: str, port: int = 8080) -> None:
     )
 
 
-def dns(node, dns1_ip: str, port: int = 53) -> None:
+def dns(node, dns1_ip: str, port: int = 53, domains=None) -> None:
     """DNS A query — expovariate(1/8) s inter-arrival."""
-    domains = ["example.com", "test.org", "service.local", "api.local", "corp.internal"]
+    if not domains:
+        return
     domain = random.choice(domains)
     node.cmd(
         f"dig @{dns1_ip} -p {port} {domain} +time=3 +tries=1 "
@@ -41,9 +42,10 @@ def dns(node, dns1_ip: str, port: int = 53) -> None:
     )
 
 
-def db_query(node, db1_ip: str, port: int = 9090) -> None:
+def db_query(node, db1_ip: str, port: int = 9090, endpoints=None) -> None:
     """DB REST GET — expovariate(1/5) s inter-arrival."""
-    endpoints = ["/api/employees", "/api/products"]
+    if not endpoints:
+        return
     ep = random.choice(endpoints)
     node.cmd(
         f"curl -sf --max-time 10 http://{db1_ip}:{port}{ep} "
@@ -51,14 +53,17 @@ def db_query(node, db1_ip: str, port: int = 9090) -> None:
     )
 
 
-def smtp(node, web1_ip: str, port: int = 25) -> None:
+def smtp(node, web1_ip: str, port: int = 25,
+         smtp_from: str = None, smtp_to: str = None) -> None:
     """SMTP send — lognormal(8,3) KB body — uniform(30,300) s inter-arrival."""
+    if not smtp_from or not smtp_to:
+        return
     body_size = min(_lognormal_bytes(8, 3), 65536)
     script = (
         "python3 -c \""
         "import smtplib;"
         f"s=smtplib.SMTP('{web1_ip}',{port},timeout=10);"
-        "s.sendmail('npc@local','user@local',"
+        f"s.sendmail('{smtp_from}','{smtp_to}',"
         f"'Subject: npc\\n\\n{'X'*body_size}');"
         "s.quit()"
         "\" 2>/dev/null || true"

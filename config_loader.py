@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from errors import EmulatorError
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,7 +113,7 @@ class LANDefinition:
     name: str
     gateway: str
     hosts: List[str]
-    isp_switch: str = "s1"   # which ISP switch this LAN gateway connects to
+    isp_switch: Optional[str] = None   # which ISP switch this LAN gateway connects to
 
 
 @dataclass
@@ -146,17 +148,18 @@ class DatabaseConfig:
 
 @dataclass
 class ExfiltrationConfig:
-    attacker:    str       = "h1"
-    target_host: str       = "db1"
-    target_port: int       = 9090
-    endpoints:   List[str] = field(default_factory=lambda: ["/api/employees", "/api/products"])
+    attacker:    Optional[str]  = None
+    target_host: Optional[str]  = None
+    target_port: Optional[int]  = None
+    endpoints:   List[str]      = field(default_factory=list)
+    attack_tos:  int            = 0x10  # IP TOS byte the attacker stamps on packets
 
 
 @dataclass
 class TimingProtocolConfig:
     """Timing protocol trigger configuration for database API responses."""
     enabled: bool = False
-    secret_key: str = "example_key"
+    secret_key: Optional[str] = None
     short_delay_ms: float = 20.0   # bit=0 inter-packet delay (ms)
     long_delay_ms: float = 50.0    # bit=1 inter-packet delay (ms)
 
@@ -248,6 +251,8 @@ class CaptureConfig:
     parser_dirs: List[str] = field(default_factory=list)
     schema_update_folder: str = "dataset/pcapng"    # compat
     schema_mimetype: str = "text/pcapng"            # compat
+    schema_file: str = "dataset/schema.json"
+    network_profile_file: str = "dataset/network_profile.json"
     cleanup_enabled: bool = False
     devices: List[str] = field(default_factory=list)
 
@@ -277,6 +282,7 @@ class TopologyConfig:
     capture_config: CaptureConfig = field(default_factory=CaptureConfig)
     device_classes: Dict[str, str] = field(default_factory=dict)
     npc_hosts:      Dict[str, str] = field(default_factory=dict)
+    npc_weights:    Dict[str, Dict[str, int]] = field(default_factory=dict)
     exfiltration:   "ExfiltrationConfig" = field(default_factory=lambda: ExfiltrationConfig())
     traffic_control: "TrafficControlConfig" = field(default_factory=lambda: TrafficControlConfig())
     attackers:      List[str] = field(default_factory=list)
@@ -350,7 +356,7 @@ def load_config(path: str) -> TopologyConfig:
     """Load and validate topology.yaml, returning a TopologyConfig."""
     config_path = Path(path)
     if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
+        raise EmulatorError("E000", f"path: {path}")
 
     logger.info("Loading configuration from %s", path)
 
@@ -389,7 +395,7 @@ def load_config(path: str) -> TopologyConfig:
             name=l["name"],
             gateway=l["gateway"],
             hosts=l.get("hosts", []),
-            isp_switch=l.get("isp_switch", "s1"),
+            isp_switch=l.get("isp_switch"),
         )
         for l in raw.get("lans", [])
     ]
@@ -471,6 +477,10 @@ def load_config(path: str) -> TopologyConfig:
         capture_config=capture_config,
         device_classes=dict(raw.get("device_classes", {})),
         npc_hosts=dict(raw.get("npc", {}).get("hosts", {})),
+        npc_weights={
+            intensity: dict(weights)
+            for intensity, weights in raw.get("npc", {}).get("weights", {}).items()
+        },
         exfiltration=_parse_exfiltration(raw.get("exfiltration", {})),
         traffic_control=_parse_traffic_control(raw.get("traffic_control", {})),
         attackers=list(raw.get("attackers", [])),
@@ -492,10 +502,11 @@ def load_config(path: str) -> TopologyConfig:
 def _parse_exfiltration(raw: dict) -> "ExfiltrationConfig":
     target = raw.get("target", {})
     return ExfiltrationConfig(
-        attacker    = raw.get("attacker", "h1"),
-        target_host = target.get("host", "db1"),
-        target_port = int(target.get("port", 9090)),
-        endpoints   = list(raw.get("endpoints", ["/api/employees", "/api/products"])),
+        attacker    = raw.get("attacker"),
+        target_host = target.get("host"),
+        target_port = int(target["port"]) if "port" in target else None,
+        endpoints   = list(raw.get("endpoints", [])),
+        attack_tos  = int(raw.get("attack_tos", 0x10)),
     )
 
 
@@ -535,7 +546,7 @@ def _parse_databases(raw_dbs: list) -> List[DatabaseConfig]:
             api_port=db.get("api_port"),
             timing_protocol=TimingProtocolConfig(
                 enabled=db.get("timing_protocol", {}).get("enabled", False),
-                secret_key=db.get("timing_protocol", {}).get("secret_key", "example_key"),
+                secret_key=db.get("timing_protocol", {}).get("secret_key"),
                 short_delay_ms=float(db.get("timing_protocol", {}).get("short_delay_ms", 20.0)),
                 long_delay_ms=float(db.get("timing_protocol", {}).get("long_delay_ms", 50.0)),
             ),
@@ -608,6 +619,8 @@ def _parse_capture_config(raw_capture: dict, raw_devices: list) -> "CaptureConfi
     schema_raw = raw_capture.get("schema") or {}
     schema_update_folder = schema_raw.get("update_folder", merged)
     schema_mimetype = schema_raw.get("mimetype", "text/pcapng")
+    schema_file = schema_raw.get("file", "dataset/schema.json")
+    network_profile_file = schema_raw.get("network_profile", "dataset/network_profile.json")
 
     # backward compat single-string endpoint fields
     feature_selector_endpoint = (
@@ -630,6 +643,8 @@ def _parse_capture_config(raw_capture: dict, raw_devices: list) -> "CaptureConfi
         parser_dirs=parser_dirs if parser_dirs else [csv_dir],
         schema_update_folder=schema_update_folder,
         schema_mimetype=schema_mimetype,
+        schema_file=schema_file,
+        network_profile_file=network_profile_file,
         cleanup_enabled=cleanup_enabled,
         devices=devices,
     )
@@ -666,9 +681,9 @@ def _normalise_dpid(raw: str) -> str:
     """Validate and zero-pad a DPID string from YAML to exactly 16 hex chars."""
     raw = raw.strip().lower().lstrip("0x")
     if not all(c in "0123456789abcdef" for c in raw):
-        raise ValueError(f"Invalid DPID {raw!r}: must be hexadecimal")
+        raise EmulatorError("E019", f"dpid={raw!r} — only 0-9 a-f allowed")
     if len(raw) > 16:
-        raise ValueError(f"Invalid DPID {raw!r}: exceeds 16 hex digits")
+        raise EmulatorError("E019", f"dpid={raw!r} — {len(raw)} chars, max 16")
     return raw.zfill(16)
 
 
@@ -710,6 +725,8 @@ def _expand_lans(config: TopologyConfig) -> None:
             add_node(h, "host")
 
         # Links: isp_switch ↔ gateway ↔ lan_switch ↔ each host
+        if not lan.isp_switch:
+            raise EmulatorError("E001", f"LAN '{lan.name}' — add isp_switch: <switch_name>")
         add_link(lan.isp_switch, lan.gateway)
         add_link(lan.gateway, sw_name)
         for h in lan.hosts:
@@ -722,40 +739,235 @@ def _expand_lans(config: TopologyConfig) -> None:
     logger.debug("lans expansion done: %d nodes, %d links", len(config.nodes), len(config.links))
 
 
+_VALID_NODE_TYPES       = {"host", "router", "switch"}
+_VALID_SERVICE_TYPES    = {"http", "https", "ftp", "smtp", "dns", "echo",
+                           "ssh", "custom_tcp", "custom_udp"}
+_VALID_GENERATOR_TYPES  = {"integer", "int", "float", "first_name", "last_name",
+                           "username", "email", "phone", "department", "salary",
+                           "product", "product_name", "category", "price",
+                           "address", "city", "country", "boolean", "bool",
+                           "text", "uuid", "date", "timestamp"}
+_VALID_VPN_MODES        = {"site_to_site", "remote_access", "hybrid"}
+_VALID_DEPLOY_MODES     = {"auto", "manual", "hybrid"}
+_VALID_FW_POLICIES      = {"restrictive", "permissive"}
+_VALID_FW_BACKENDS      = {"iptables", "nftables"}
+_VALID_NPC_INTENSITIES  = {"low", "medium", "high"}
+
+
 def _validate(config: TopologyConfig) -> None:
-    """Raise ValueError on any structural inconsistency."""
+    """Raise EmulatorError on any structural inconsistency."""
+    import ipaddress as _ip
     names = {n.name for n in config.nodes}
 
     for a, b in config.links:
         for name in (a, b):
             if name not in names:
-                raise ValueError(f"Link references unknown node: {name!r}")
+                raise EmulatorError("E003", f"node {name!r} — declare it under nodes:")
 
     for gw in config.lan_gateways:
         if gw not in names:
-            raise ValueError(f"lan_gateway references unknown node: {gw!r}")
+            raise EmulatorError("E004", f"gateway {gw!r} — declare it under nodes:")
         node = config.get_node(gw)
         if node and node.is_switch():
-            raise ValueError(f"lan_gateway {gw!r} is a switch — must be router or host")
+            raise EmulatorError("E005", f"{gw!r} has type: switch — change to router or host")
 
     for gw in config.vpn_gateways:
         if gw not in names:
-            raise ValueError(f"vpn_gateway references unknown node: {gw!r}")
+            raise EmulatorError("E006", f"gateway {gw!r} — declare it under nodes:")
 
     for vp in config.vpn_peers:
         if vp.gateway not in names:
-            raise ValueError(f"vpn_peer gateway {vp.gateway!r} unknown")
+            raise EmulatorError("E007", f"gateway {vp.gateway!r} — declare it under nodes:")
         for client in vp.clients:
             if client not in names:
-                raise ValueError(f"vpn_peer client {client!r} unknown")
+                raise EmulatorError("E008", f"client {client!r} — declare it under nodes:")
 
     for svc in config.services:
         if svc.host not in names:
-            raise ValueError(f"service host {svc.host!r} unknown")
+            raise EmulatorError("E009", f"host {svc.host!r} — declare it under nodes:")
 
     for db in config.databases:
         if db.host not in names:
-            raise ValueError(f"database host {db.host!r} unknown")
+            raise EmulatorError("E010", f"host {db.host!r} — declare it under nodes:")
+        tp = getattr(db, "timing_protocol", None)
+        if tp and tp.enabled and not tp.secret_key:
+            raise EmulatorError("E011",
+                f"db '{db.name}' on {db.host} — add secret_key under timing_protocol:")
+        if tp and tp.enabled and tp.secret_key:
+            if tp.short_delay_ms >= tp.long_delay_ms:
+                raise EmulatorError("E012",
+                    f"db '{db.name}': short_delay_ms={tp.short_delay_ms} "
+                    f">= long_delay_ms={tp.long_delay_ms}")
+
+    exfil = getattr(config, "exfiltration", None)
+    if exfil:
+        if exfil.attacker:
+            if config.attackers and exfil.attacker not in config.attackers:
+                # attackers: list declared but exfil.attacker not in it
+                raise EmulatorError("E013",
+                    f"{exfil.attacker!r} — add it to attackers: list or remove the attackers: section")
+            if exfil.attacker not in names:
+                # no attackers: list — validate directly against nodes
+                raise EmulatorError("E030",
+                    f"exfiltration.attacker={exfil.attacker!r} — declare it under nodes:")
+        if exfil.target_host:
+            db_hosts_with_api = {db.host for db in config.databases if db.api_port}
+            if exfil.target_host not in db_hosts_with_api:
+                raise EmulatorError("E014",
+                    f"{exfil.target_host!r} — add api_port under databases[].host: {exfil.target_host}")
+        if exfil.target_host and exfil.target_port:
+            for db in config.databases:
+                if db.host == exfil.target_host and db.api_port != exfil.target_port:
+                    raise EmulatorError("E016",
+                        f"exfiltration.target.port={exfil.target_port} but "
+                        f"databases[host={db.host}].api_port={db.api_port}")
+        tos = getattr(exfil, "attack_tos", None)
+        if tos is not None and not (0 <= tos <= 255):
+            raise EmulatorError("E015", f"attack_tos={tos} — must be 0–255 (0x00–0xFF)")
+
+    if config.vpn_config.enabled and not config.vpn_config.server_node:
+        raise EmulatorError("E018",
+            "set vpn.server.node: <gateway_name> or set vpn.enabled: false")
+
+    # ── Node types ────────────────────────────────────────────────────────────
+    for node in config.nodes:
+        if node.type not in _VALID_NODE_TYPES:
+            raise EmulatorError("E038",
+                f"node {node.name!r} has type={node.type!r}")
+
+    # ── Settings CIDR formats ─────────────────────────────────────────────────
+    for field, value in [
+        ("isp_base_network",  config.settings.isp_base_network),
+        ("lan_base_network",  config.settings.lan_base_network),
+        ("vpn_base_network",  config.settings.vpn_base_network),
+    ]:
+        try:
+            _ip.IPv4Network(value, strict=False)
+        except ValueError:
+            raise EmulatorError("E039", f"settings.{field}: {value!r}")
+
+    # ── VPN mode ──────────────────────────────────────────────────────────────
+    if config.vpn_config.mode not in _VALID_VPN_MODES:
+        raise EmulatorError("E032", f"vpn.mode={config.vpn_config.mode!r}")
+
+    # ── Deployment mode ───────────────────────────────────────────────────────
+    if config.deployment.mode not in _VALID_DEPLOY_MODES:
+        raise EmulatorError("E035", f"deployment.mode={config.deployment.mode!r}")
+
+    # ── Firewall policy / backend ─────────────────────────────────────────────
+    fw = config.security.firewall
+    if fw.enabled:
+        if fw.policy not in _VALID_FW_POLICIES:
+            raise EmulatorError("E033", f"firewall.policy={fw.policy!r}")
+        if fw.backend not in _VALID_FW_BACKENDS:
+            raise EmulatorError("E034", f"firewall.backend={fw.backend!r}")
+
+    # ── Service types and port ranges ─────────────────────────────────────────
+    host_ports: Dict[str, set] = {}
+    for svc in config.services:
+        if svc.type not in _VALID_SERVICE_TYPES:
+            raise EmulatorError("E021", f"services[host={svc.host}] type={svc.type!r}")
+        if svc.port is not None:
+            if not (1 <= svc.port <= 65535):
+                raise EmulatorError("E043",
+                    f"services[host={svc.host}, type={svc.type}] port={svc.port}")
+            if svc.port in host_ports.get(svc.host, set()):
+                raise EmulatorError("E022",
+                    f"host={svc.host!r} port={svc.port} used by two services")
+            host_ports.setdefault(svc.host, set()).add(svc.port)
+
+    # ── Database api_port range and table generator types ────────────────────
+    for db in config.databases:
+        if db.api_port is not None and not (1 <= db.api_port <= 65535):
+            raise EmulatorError("E042",
+                f"databases[host={db.host}, name={db.name}] api_port={db.api_port}")
+        tp = getattr(db, "timing_protocol", None)
+        if tp and tp.enabled:
+            if tp.short_delay_ms <= 0 or tp.long_delay_ms <= 0:
+                raise EmulatorError("E044",
+                    f"db '{db.name}': short={tp.short_delay_ms}ms long={tp.long_delay_ms}ms")
+        for table in db.tables:
+            for col, gen_type in table.schema.items():
+                if col == "id":
+                    continue
+                if gen_type.lower() not in _VALID_GENERATOR_TYPES:
+                    raise EmulatorError("E023",
+                        f"db '{db.name}' table '{table.name}' column '{col}': "
+                        f"type={gen_type!r}")
+
+    # ── Attackers declared in nodes ───────────────────────────────────────────
+    for attacker in config.attackers:
+        if attacker not in names:
+            raise EmulatorError("E030",
+                f"{attacker!r} — declare it under nodes:")
+
+    # ── NPC host intensities ──────────────────────────────────────────────────
+    for host, intensity in config.npc_hosts.items():
+        if intensity not in _VALID_NPC_INTENSITIES:
+            raise EmulatorError("E037",
+                f"npc.hosts.{host}: {intensity!r}")
+
+    # ── NPC weights — keys must be valid intensities, values non-negative ints ─
+    _VALID_NPC_BEHAVIORS = {"http", "bulk", "dns", "ftp", "smtp", "db", "echo", "idle"}
+    for intensity, weights in config.npc_weights.items():
+        if intensity not in _VALID_NPC_INTENSITIES:
+            raise EmulatorError("E037",
+                f"npc.weights.{intensity!r} — invalid intensity key")
+        for behavior, weight in weights.items():
+            if behavior not in _VALID_NPC_BEHAVIORS:
+                raise EmulatorError("E049",
+                    f"npc.weights.{intensity}.{behavior!r} — unknown behavior. "
+                    f"Valid: {sorted(_VALID_NPC_BEHAVIORS)}")
+            if not isinstance(weight, int) or weight < 0:
+                raise EmulatorError("E049",
+                    f"npc.weights.{intensity}.{behavior}: {weight!r} — must be non-negative int")
+
+    # ── Static routes node references and CIDR format ────────────────────────
+    for route in getattr(config, "static_routes", []):
+        if route.node not in names:
+            raise EmulatorError("E027",
+                f"routes[node={route.node!r}] — declare it under nodes:")
+        try:
+            _ip.IPv4Network(route.destination, strict=False)
+        except ValueError:
+            raise EmulatorError("E028",
+                f"routes[node={route.node}] destination={route.destination!r} is not valid CIDR")
+        try:
+            _ip.ip_address(route.via)
+        except ValueError:
+            raise EmulatorError("E028",
+                f"routes[node={route.node}] via={route.via!r} is not a valid IP")
+
+    # ── capture.devices cross-check against declared nodes ───────────────────
+    for device in config.capture_config.devices:
+        if device not in names:
+            raise EmulatorError("E017",
+                f"capture.devices: {device!r} not declared in nodes:")
+
+    # ── device_classes keys must reference declared nodes ────────────────────
+    for dc_node in config.device_classes:
+        if dc_node not in names:
+            raise EmulatorError("E045",
+                f"device_classes.{dc_node!r} — node not declared in nodes:")
+
+    # ── traffic_control interface names — validated at topology build time ───
+    # TC interface names use Mininet aliases (e.g. 'lss1-eth0' for 'lan_sw_sitea')
+    # which are only computed by ip_allocator. Cannot validate here without allocation.
+
+    # ── vpn_peers.clients — no duplicates ─────────────────────────────────────
+    for vp in config.vpn_peers:
+        seen = set()
+        for client in vp.clients:
+            if client in seen:
+                raise EmulatorError("E047",
+                    f"vpn_peers[gateway={vp.gateway}].clients: {client!r} listed twice")
+            seen.add(client)
+
+    # ── npc.hosts keys must reference declared nodes ─────────────────────────
+    for npc_host in config.npc_hosts:
+        if npc_host not in names:
+            raise EmulatorError("E048",
+                f"npc.hosts.{npc_host!r} — node not declared in nodes:")
 
     if not config.get_switches():
-        raise ValueError("Topology must have at least one ISP switch")
+        raise EmulatorError("E002", "add at least one node with type: switch")

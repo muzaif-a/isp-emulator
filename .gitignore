@@ -14,7 +14,7 @@ tests/*
 run.sh
 requirements-lock.txt
 configs/preregistration.yaml
-
+docs/
 # Generated datasets
 dataset/pcapng/*
 !dataset/pcapng/.gitkeep

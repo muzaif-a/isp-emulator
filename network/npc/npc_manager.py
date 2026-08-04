@@ -40,7 +40,7 @@ _HEAVY = {"ftp", "smtp", "bulk"}
 class NPCManager:
     """Round-based NPC traffic orchestrator."""
 
-    def __init__(self, net, allocation, host_intensity: Dict[str, str] = None) -> None:
+    def __init__(self, net, config, allocation, host_intensity: Dict[str, str] = None) -> None:
         self.net            = net
         self.allocation     = allocation
         self._host_intensity: Dict[str, str] = host_intensity or {}
@@ -52,12 +52,55 @@ class NPCManager:
         self._running    = False
         self._heavy_sem  = threading.Semaphore(_MAX_HEAVY)
 
-        # Resolve service IPs once at construction
-        self._web1_ip  = allocation.get_host_ip("web1") or "127.0.0.1"
-        self._ftp1_ip  = allocation.get_host_ip("ftp1") or "127.0.0.1"
-        self._dns1_ip  = allocation.get_host_ip("dns1") or "127.0.0.1"
-        self._db1_ip   = allocation.get_host_ip("db1")  or "127.0.0.1"
-        self._echo_ip  = allocation.get_host_ip("h1")   or "127.0.0.1"
+        # Merge YAML weight overrides at the behavior level — unspecified behaviors
+        # keep their CAIDA defaults. Only the listed behaviors are overridden.
+        yaml_weights = getattr(config, "npc_weights", {})
+        self._weights = {}
+        for intensity, caida in WEIGHTS.items():
+            override = yaml_weights.get(intensity, {})
+            self._weights[intensity] = {**caida, **override}
+
+        # Resolve service node IPs from config.services — no hardcoded node names
+        def _first_ip(svc_type: str) -> Optional[str]:
+            for svc in config.services:
+                if svc.type == svc_type:
+                    return allocation.get_host_ip(svc.host)
+            return None
+
+        self._web1_ip  = _first_ip("http")
+        self._ftp1_ip  = _first_ip("ftp")
+        self._dns1_ip  = _first_ip("dns")
+        self._echo_ip  = _first_ip("echo")
+        self._smtp_ip  = _first_ip("smtp")
+
+        # DB IP from config.databases (not config.services)
+        self._db1_ip = (
+            allocation.get_host_ip(config.databases[0].host)
+            if config.databases else None
+        )
+
+        # DB REST endpoints from exfiltration config, else from database tables
+        exfil_endpoints = getattr(getattr(config, "exfiltration", None), "endpoints", None)
+        if exfil_endpoints:
+            self._db_endpoints = list(exfil_endpoints)
+        elif config.databases:
+            self._db_endpoints = [
+                f"/api/{t.name}" for t in config.databases[0].tables
+            ]
+        else:
+            self._db_endpoints = []
+
+        # SMTP sender/recipient derived from topology node names
+        smtp_svc = next((s for s in config.services if s.type == "smtp"), None)
+        smtp_node = smtp_svc.host if smtp_svc else "smtp"
+        self._smtp_from = f"npc@{smtp_node}.local"
+        self._smtp_to   = f"user@{smtp_node}.local"
+
+        # DNS query targets: synthetic FQDNs from actual topology node names
+        self._dns_domains = [
+            f"{name}.local"
+            for name in sorted(allocation.node_interfaces.keys())
+        ]
 
     # ------------------------------------------------------------------ public
 
@@ -135,7 +178,7 @@ class NPCManager:
     def _host_loop(
         self, host: str, intensity: str, stop_ev: threading.Event
     ) -> None:
-        weights_map = WEIGHTS.get(intensity, WEIGHTS["medium"])
+        weights_map = self._weights.get(intensity, self._weights.get("medium", WEIGHTS["medium"]))
         node        = self.net[host]
         stat        = self._stats[host]
 
@@ -181,19 +224,20 @@ class NPCManager:
             if not self._heavy_sem.acquire(blocking=False):
                 return   # at concurrent cap — skip this round
         try:
-            if behavior == "http":
+            if behavior == "http" and self._web1_ip:
                 _beh.http(node, self._web1_ip)
-            elif behavior == "dns":
-                _beh.dns(node, self._dns1_ip)
-            elif behavior == "db":
-                _beh.db_query(node, self._db1_ip)
-            elif behavior == "smtp":
-                _beh.smtp(node, self._web1_ip)
-            elif behavior == "ftp":
+            elif behavior == "dns" and self._dns1_ip:
+                _beh.dns(node, self._dns1_ip, domains=self._dns_domains)
+            elif behavior == "db" and self._db1_ip and self._db_endpoints:
+                _beh.db_query(node, self._db1_ip, endpoints=self._db_endpoints)
+            elif behavior == "smtp" and self._smtp_ip:
+                _beh.smtp(node, self._smtp_ip,
+                          smtp_from=self._smtp_from, smtp_to=self._smtp_to)
+            elif behavior == "ftp" and self._ftp1_ip:
                 _beh.ftp(node, self._ftp1_ip)
             elif behavior == "bulk" and peers:
                 _beh.bulk(node, random.choice(peers))
-            elif behavior == "echo":
+            elif behavior == "echo" and self._echo_ip:
                 _beh.echo(node, self._echo_ip)
             elif behavior == "idle":
                 _beh.idle(node)
