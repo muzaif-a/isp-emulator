@@ -32,8 +32,10 @@ Mininet-based ISP/enterprise network emulator. Generates labeled PCAPNG datasets
 | `network/capture_manager.py` | Sniffer subprocesses + merge + schema.json pipeline |
 | `network/npc/npc_manager.py` | Background NPC traffic orchestrator |
 | `network/npc/behaviors.py` | http/dns/db/smtp/ftp/bulk/echo/idle implementations |
-| `services/database/database_manager.py` | SQLite + REST API + application-layer watermark injector |
-| `services/database/timing_protocol.py` | SHA-512 covert timing channel config |
+| `services/database/database_manager.py` | SQLite + REST API; selects watermark engine at startup |
+| `services/database/rhythm_computer.py` | `WatermarkBitstream` — precomputes 512-bit SHA-512 rhythm; stateless |
+| `services/database/app_watermarking.py` | `AppWatermark` — app-layer delays in `/backup` handler; arm/disarm/session_snapshot |
+| `services/database/net_watermarking.py` | `NetWatermark` — network-layer NFQUEUE delays; same interface as `AppWatermark` |
 | `services/database/generators.py` | Synthetic row data (no external deps) |
 | `scripts/auto_gen.py` | pexpect CLI driver; `mn -c` isolation per experiment |
 | `scripts/analyze_watermark.py` | IPD-based watermark survival analysis; writes watermark_log |
@@ -76,7 +78,7 @@ auto_gen.py (pexpect)
 
 **NPC:** one daemon thread per host. Priming phase fires all protocols once. Heavy cap: semaphore(min(4, cpu-2)).
 
-**Timing channel (application-layer):** SHA-512(secret_key) precomputed at API server startup → 512-bit pool. TOS sniffer (scapy, inside DB namespace) detects attacker SYN (TOS=0x10) → `new_session()` → sets `_WM_ARMED`. `/backup` handler waits for `_WM_ARMED`, then for each 512B chunk: write → flush → `clock_nanosleep(bit=0 → short_delay_ms, bit=1 → long_delay_ms)`. Delay after write so `IPD_i = f(bit_i)`. FIN detected → `finalize_session()` snapshots rhythm + packet count → writes `/tmp/timing_<host>_<db>.json`. No nftables or NFQUEUE required.
+**Timing channel:** SHA-512(secret_key) precomputed at DB startup → 512-bit `_WM_BITS[]` (cycles mod 512, no recompute). TOS sniffer (scapy, inbound) detects attacker SYN (TOS=0x10) → `_wm.arm()`. Engine selected by `timing_protocol.type` in YAML: `net-flow` uses `NetWatermark` (NFQUEUE delays each outgoing TCP segment before kernel sends it); `app-flow` uses `AppWatermark` (sleeps between 512B chunk writes in HTTP handler); `auto` tries net-flow, falls back to app-flow. Both engines expose identical interface: `arm()`, `disarm()`, `reset()`, `session_snapshot()`. Delay after write so `IPD_i = f(bit_i)`. FIN detected → `_finalize_session()` → `_wm.session_snapshot()` → writes `/tmp/timing_<host>_<db>.json`.
 
 **Watermark analysis:** `scripts/analyze_watermark.py` reads PCAP via scapy, extracts DB→attacker TCP segments, computes IPDs, classifies SHORT/LONG/AMBIGUOUS, compares with SHA-512 expected bitstream. Verdict (DETECTED/NOT_DETECTED) is from survival_pct — not from experiment labels. TP/TN/FP/FN classification uses `experiment.exfil` field from schema.json.
 
@@ -109,6 +111,6 @@ auto_gen.py (pexpect)
 - New topology: copy YAML, test with `--cli`. `_validate()` raises `EmulatorError` on violations.
 - New service: add to `service_manager.py` + `ServiceConfig.type` docs in `config_loader.py`.
 - New NPC behavior: see `Guide.md §9`.
-- Timing protocol changes: edit `services/database/database_manager.py` (`_API_SCRIPT`) + `config_loader.py` defaults. Never touch `configs/preregistration.yaml`.
+- Timing protocol changes: rhythm math in `services/database/rhythm_computer.py`; engine logic in `app_watermarking.py` / `net_watermarking.py`; `_API_SCRIPT` wiring in `database_manager.py`; YAML defaults in `config_loader.py`. Never touch `configs/preregistration.yaml`.
 - Do not add hardcoded IPs — all addresses flow from `ip_allocator.py`.
 - Watermark delay is applied AFTER each chunk write (delay-after-write). Changing to delay-before-write causes off-by-one in IPD→bit mapping → analyzer survival ≈ 50% → false negatives.

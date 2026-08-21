@@ -111,11 +111,13 @@ isp-emulator/
 │   ├── service_registry.py       Registry of running services
 │   ├── service_discovery.py      Scan for undeclared running services
 │   └── database/
-│       ├── database_manager.py   SQLite + REST API + application-layer watermark injector
+│       ├── database_manager.py   SQLite + REST API; selects watermark engine at startup
+│       ├── rhythm_computer.py    WatermarkBitstream — precomputes 512-bit SHA-512 rhythm
+│       ├── app_watermarking.py   AppWatermark — app-layer delays in /backup handler
+│       ├── net_watermarking.py   NetWatermark — network-layer NFQUEUE delays
 │       ├── synthetic_data.py     Row generation from schema
 │       ├── generators.py         Per-field synthetic data generators
-│       ├── schema_builder.py     SQLite DDL builder
-│       └── timing_protocol.py    Timing-channel config dataclass
+│       └── schema_builder.py     SQLite DDL builder
 │
 ├── scripts/
 │   ├── auto_gen.py               Experiment automation runner (pexpect)
@@ -280,19 +282,27 @@ For each `DatabaseConfig`:
 3. Data inserted via Python's `sqlite3`.
 4. Flask REST API started on `api_port` (if configured): `GET /api/{table}` returns all rows; `POST /timing/set` updates timing channel state.
 
-### Timing Protocol (`services/database/timing_protocol.py`)
+### Timing Protocol (`services/database/rhythm_computer.py`)
 
-Deterministic covert timing channel.
+Deterministic covert timing channel with pluggable watermark engine.
 
-**Mechanism:** `SHA-512(secret_key:start_timestamp:nonce)` generates a 512-bit pool. `start_timestamp` is the Unix timestamp of the first TOS-marked packet — acts as a session-unique salt so keystreams from the same key differ per session. Each bit: 0 → sleep `short_delay_ms`; 1 → sleep `long_delay_ms`. On pool exhaustion, nonce increments and a new digest is computed.
+**Rhythm:** `SHA-512(secret_key)` → 512-bit `_WM_BITS[]`. Index cycles mod 512 — no recompute for transfers longer than 512 chunks. Bit 0 → sleep `short_delay_ms`; bit 1 → sleep `long_delay_ms`.
 
-**Metadata accumulated per request:** rhythm (bit sequence), nonces used, packet count, start/end timestamps, src/dest IPs.
+**Engine selection** (`timing_protocol.type` in YAML):
 
-**Detection:** observer measures inter-packet delays (IPDs). IPDs ≈ `short_delay_ms` → bit=0; IPDs ≈ `long_delay_ms` → bit=1. Decoded bitstream matches `SHA-512(key:t0:1)` given known key and recorded `start_timestamp`.
+| `type` | Engine | Delay point |
+|--------|--------|-------------|
+| `app-flow` | `AppWatermark` | Python `clock_nanosleep` between 512B chunk writes in `/backup` HTTP handler |
+| `net-flow` | `NetWatermark` | NFQUEUE intercepts outgoing TCP segment, delays it before kernel sends (requires `python3-netfilterqueue` + nftables, root) |
+| `auto` | tries net-flow, falls back to app-flow | — |
+
+Both engines expose the same interface: `arm(attacker_ip, start_ts)`, `disarm()`, `reset()`, `session_snapshot()`.
+
+**Session lifecycle:** TOS sniffer (scapy, inbound) detects attacker SYN (TOS=0x10) → `_wm.arm()`. FIN/RST → `_finalize_session()` → `_wm.session_snapshot()` → state file `/tmp/timing_{host}_{db}.json`. Read by `CaptureManager` at `capture stop` to populate `schema.json`.
+
+**Detection:** observer measures inter-packet delays (IPDs). IPDs ≈ `short_delay_ms` → bit=0; IPDs ≈ `long_delay_ms` → bit=1. Decoded bitstream matches `SHA-512(secret_key)` bits in order.
 
 See `mechanism.md §15` for full formulas and signal-to-noise analysis.
-
-State file: `/tmp/timing_{host}_{db}.json`. Read by `CaptureManager` at `capture stop` to populate `schema.json`.
 
 `/timing/set` endpoint enables `inject on/off` to enable/disable the channel at runtime.
 
@@ -461,6 +471,7 @@ All configuration and runtime failures raise `EmulatorError` instead of bare Pyt
               timing_protocol:
                 enabled: true
                 secret_key: your-real-secret-here   ← add this line
+                type: auto                           # net-flow | app-flow | auto
 
   YAML key: databases[].timing_protocol.secret_key
   Guide   : Guide.md §3.7 databases → timing_protocol  →  E011
@@ -589,7 +600,7 @@ sudo mn -c
 
 **New feature column:** see [Guide.md — Developer Recipes](Guide.md#9-developer-recipes).
 
-**Timing protocol changes:** edit `services/database/timing_protocol.py` for logic; edit `config_loader.py` defaults for new YAML keys. Do not modify frozen values in `configs/preregistration.yaml`.
+**Timing protocol changes:** rhythm math in `services/database/rhythm_computer.py`; engine logic in `app_watermarking.py` (app-layer) / `net_watermarking.py` (NFQUEUE); `_API_SCRIPT` wiring in `database_manager.py`; YAML defaults in `config_loader.py`. Do not modify frozen values in `configs/preregistration.yaml`.
 
 ---
 

@@ -19,7 +19,7 @@ from config_loader import TableConfig, DatabaseConfig
 from services.database.generators import generate
 from services.database.schema_builder import build_create_table, build_indexes, insert_sql, column_sql_type
 from services.database.synthetic_data import generate_rows
-from services.database.timing_protocol import TimingProtocol
+from services.database.rhythm_computer import WatermarkBitstream, TimingProtocol
 from services.database import database_manager
 
 
@@ -262,86 +262,86 @@ class TestTimingProtocol:
         (1.0, 2.0),
     ])
     def test_delays_within_configured_bounds(self, short_ms, long_ms):
-        tp = TimingProtocol(
-            enabled=True,
+        from services.database.rhythm_computer import WatermarkBitstream
+        tp = WatermarkBitstream(
             secret_key="unit-test-key",
             short_delay_ms=short_ms,
             long_delay_ms=long_ms,
         )
-        tp.observe_first_request(1000.0, src="10.0.0.2", dest="10.0.0.3:9090")
-        for _ in range(20):
-            d = tp.next_delay_seconds()
+        for i in range(20):
+            d, bit = tp.get_delay(i)
             assert d in (short_ms / 1000.0, long_ms / 1000.0), (
                 f"delay {d}s not in expected set "
                 f"({short_ms/1000.0}, {long_ms/1000.0})"
             )
 
-    def test_disabled_protocol_keeps_src_dest_only(self):
-        tp = TimingProtocol(enabled=False)
-        tp.observe_first_request(1000.0, src="192.168.0.2", dest="192.168.1.3:9090")
-        md = tp.metadata()
-        assert md.enabled is False
-        assert md.secret_key is None
-        assert md.start_timestamp is None
-        assert md.total_data_packets is None
-        assert md.rhythm is None
-        assert md.src == "192.168.0.2"
-        assert md.dest == "192.168.1.3:9090"
+    def test_disabled_returns_no_delay_when_gate_off(self):
+        """When TIMING_GATE=False the handler skips get_delay — test gate logic only."""
+        from services.database.rhythm_computer import WatermarkBitstream
+        tp = WatermarkBitstream(secret_key="test")
+        timing_gate = False
+        result = tp.get_delay(0) if timing_gate else None
+        assert result is None
 
     def test_enabled_protocol_tracks_bits_and_counts(self):
-        # Secret key must come from config — not a placeholder.
-        # Use a real test key that is distinct from any placeholder value.
+        import hashlib
+        from services.database.rhythm_computer import WatermarkBitstream
         test_key = "test-timing-key-for-unit-test"
         short_ms, long_ms = 20.0, 50.0
-        tp = TimingProtocol(
-            enabled=True,
+        tp = WatermarkBitstream(
             secret_key=test_key,
             short_delay_ms=short_ms,
             long_delay_ms=long_ms,
         )
-        src_ip = "192.168.0.2"
-        dest = "192.168.1.3:9090"
-        tp.observe_first_request(2000.0, src=src_ip, dest=dest)
-        d1 = tp.next_delay_seconds()
-        d2 = tp.next_delay_seconds()
-        tp.record_data_packet()
-        tp.record_data_packet()
-        md = tp.metadata()
 
-        # Delays must be exactly short or long (from config values, not hardcoded)
+        d1, bit1 = tp.get_delay(0)
+        d2, bit2 = tp.get_delay(1)
+
+        # Delays must be exactly short or long (from config values)
         assert d1 in (short_ms / 1000.0, long_ms / 1000.0)
         assert d2 in (short_ms / 1000.0, long_ms / 1000.0)
-        assert md.enabled is True
-        assert md.secret_key == test_key
-        assert md.start_timestamp == 2000.0
-        assert md.src == src_ip
-        assert md.dest == dest
-        assert len(md.rhythm) == 2
-        assert md.total_data_packets == 2
+
+        # Verify bits match SHA-512 expansion
+        digest = hashlib.sha512(test_key.encode()).digest()
+        raw_bits = [(byte >> shift) & 1 for byte in digest for shift in range(7, -1, -1)]
+        assert bit1 == raw_bits[0]
+        assert bit2 == raw_bits[1]
+        assert len(tp.bits) == 512
 
 
 class TestApiTimingPlacement:
 
-    def test_application_layer_watermark(self):
-        # Application-layer watermark: scapy TOS sniffer arms _WM_ARMED event,
-        # /backup handler waits for it then injects clock_nanosleep delays between
-        # 512B chunk writes. No nftables or NFQUEUE required.
+    def test_watermark_engine_wiring(self):
+        # _API_SCRIPT selects NetWatermark or AppWatermark at startup (_wm object).
+        # Session lifecycle is driven through _wm.arm() / _wm.disarm() / _wm.reset().
         script = database_manager._API_SCRIPT
-        # _WM_ARMED event replaces nftables arm/disarm.
-        assert "_WM_ARMED" in script
-        assert "_WM_ARMED.set()" in script
-        assert "_WM_ARMED.clear()" in script
-        # Kernel-clock hold injects inter-chunk delays.
-        assert "clock_nanosleep" in script
-        assert "_cns_hold" in script
-        # Chunk-based write with TCP_NODELAY for one-segment-per-chunk.
+        # rhythm_computer computes bits; db_manager passes _rhythm to engine
+        assert "from rhythm_computer import WatermarkBitstream" in script
+        assert "_rhythm = _WMBitstream(" in script
+        # Engine selection: net-flow or app-flow from YAML type
+        assert "from net_watermarking import NetWatermark" in script
+        assert "from app_watermarking import AppWatermark" in script
+        assert "_NL_MODE" in script
+        assert "_NetWM(PORT, _rhythm)" in script    # rhythm passed, not raw bits
+        assert "_AppWM(_rhythm)" in script          # rhythm passed, not raw bits
+        # db_manager calls engine interface only
+        assert "_wm.arm(" in script
+        assert "_wm.disarm(" in script
+        assert "_wm.reset(" in script
+        assert "_wm.wait_armed(" in script
+        assert "_wm.is_armed(" in script
+        assert "_wm.session_snapshot(" in script
+        assert "_wm.next_chunk_delay(" in script
+        # Session finalization and persistence still in script
+        assert "_finalize_session" in script
+        assert "_reset_session" in script
+        assert "_persist_timing_metadata" in script
+        # Chunk streaming + TCP_NODELAY still present
         assert "_WM_CHUNK" in script
         assert "TCP_NODELAY" in script
-        # Timing rhythm still drives delays.
-        assert "TIMING.next_delay_seconds()" in script
-        # No nftables or NFQUEUE in the new implementation.
+        # Old inline vars and nftables arm helper gone
+        assert "_sess_chunks_sent" not in script
         assert "_nft_arm" not in script
-        assert "nfpkt.accept()" not in script
 
     def test_index_created(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:

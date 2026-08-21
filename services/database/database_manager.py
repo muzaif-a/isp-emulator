@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 _API_SCRIPT = r'''#!/usr/bin/env python3
 """Auto-generated CRUD REST API for SQLite — ISP emulator."""
 import atexit
-import hashlib
 import json
 import os
 import socket
@@ -50,6 +49,8 @@ import ctypes as _ctypes
 import threading as _threading
 
 ATTACK_TOS   = int(sys.argv[8], 0) if len(sys.argv) > 8 else 0x10
+# watermark type from YAML timing_protocol.type: "net-flow" | "app-flow" | "auto"
+TIMING_WM_TYPE = sys.argv[9].strip().lower() if len(sys.argv) > 9 else 'auto'
 TIMING_GATE  = TIMING_ENABLED   # runtime toggle — POST /timing/set {"enabled": false}
 
 # ── structured log — writes directly to file (node.cmd PTY redirect unreliable)
@@ -107,235 +108,152 @@ def _cns_hold(delay_s):
     while _librt.clock_nanosleep(_CLOCK_MONO, _ABSTIME, _ctypes.byref(ts), None) == 4:
         pass   # EINTR — retry to absolute deadline
 
-# ── Application-layer watermark gate ─────────────────────────────────────────
-# Delays injected directly in the /backup HTTP handler — no nftables, no NFQUEUE.
-# TOS sniffer sets _WM_ARMED when a session starts; handler waits before sending.
-_WM_ARMED = _threading.Event()  # set by new_session(); /backup waits on this
+# ── Precomputed rhythm via rhythm_computer.WatermarkBitstream ────────────────
+# rhythm_computer.py owns the SHA-512 → 512-bit expansion and delay lookup.
+# db_manager gets _rhythm and passes it to the chosen engine.
+# Engines call _rhythm.get_delay(idx) — mod-512 rotation is inside WatermarkBitstream.
+sys.path.insert(0, '/tmp')
+from rhythm_computer import WatermarkBitstream as _WMBitstream
+_rhythm = _WMBitstream(TIMING_SECRET or '', TIMING_SHORT_MS, TIMING_LONG_MS)
+_log('STARTUP', f'rhythm precomputed — {len(_rhythm.bits)} bits from SHA-512(secret)')
+
+# ── Watermark engine — selected by TIMING_WM_TYPE from YAML timing_protocol.type ─
+# Both NetWatermark and AppWatermark expose the same interface:
+#   arm(), disarm(), reset(), is_armed(), wait_armed(), session_snapshot()
+# Drop-in replaceable: swap _wm to change mode without touching the rest of the script.
+#
+# TIMING_WM_TYPE:
+#   "net-flow"  → force NetWatermark (NFQUEUE); hard-fail if unavailable
+#   "app-flow"  → force AppWatermark (delays in /backup handler)
+#   "auto"      → try NetWatermark first, fall back to AppWatermark silently
+_wm      = None
+_NL_MODE = False
+
+if TIMING_ENABLED:
+    if TIMING_WM_TYPE in ('net-flow', 'auto'):
+        try:
+            from net_watermarking import NetWatermark as _NetWM
+            _wm = _NetWM(PORT, _rhythm)   # rhythm owns bits + delay lookup
+            if _wm.setup():
+                _NL_MODE = True
+                atexit.register(_wm.teardown)
+                _log('WM', f'network-layer (net-flow) ON — nft table wm_{PORT} queue {PORT % 100}')
+            else:
+                _wm = None
+                raise RuntimeError('NetWatermark.setup() returned False')
+        except Exception as _nw_e:
+            if TIMING_WM_TYPE == 'net-flow':
+                raise RuntimeError(f'net-flow requested but failed: {_nw_e}')
+            _wm = None
+            _log('WM', f'net-flow unavailable ({_nw_e}) — falling back to app-flow')
+
+    if _wm is None:   # app-flow forced, or net-flow fell back
+        from app_watermarking import AppWatermark as _AppWM
+        _wm = _AppWM(_rhythm)   # rhythm owns bits + delay lookup
+        _log('WM', f'app-layer (app-flow) ON — delays injected in /backup handler')
+
+_log('WM', f'engine={_wm.MODE if _wm else "none"} type={TIMING_WM_TYPE} NL_MODE={_NL_MODE}')
+
+# ── Session finalization ──────────────────────────────────────────────────────
+_all_sessions = []          # finalized session dicts
+_sess_lock    = _threading.Lock()
+_active_sport = None        # sport of current TOS connection; None when idle
 
 
-class TimingProtocol:
-    def __init__(self, secret_key=None, short_delay_ms=20.0, long_delay_ms=50.0):
-        self.secret_key = secret_key
-        self.short_delay_s = short_delay_ms / 1000.0
-        self.long_delay_s  = long_delay_ms  / 1000.0
-        self._lock = _threading.Lock()
-        self._sessions = []   # finalized per-request entries
-        digest = hashlib.sha512((secret_key or '').encode('utf-8')).digest()
-        self._fixed_bits = [
-            (byte >> shift) & 1
-            for byte in digest
-            for shift in range(7, -1, -1)
-        ]
-        self._reset_state()
-
-    def _reset_state(self):
-        """Reset current-request state. Does NOT clear _sessions accumulator."""
-        self.enabled          = False
-        self.start_timestamp  = None
-        self.end_timestamp    = None
-        self.src              = None
-        self.dest             = None
-        self._pool            = list(self._fixed_bits)   # reset circular buffer
-        self._rhythm          = []
-        self._total_packets   = 0
-        _WM_ARMED.clear()   # next /backup must wait for new TOS session
-
-    def reset(self):
-        """Full reset — clears all sessions. Called between experiments."""
-        global _active_sport
-        with self._lock:
-            self._sessions = []
-            self._reset_state()
-        _active_sport = None
-        _WM_ARMED.clear()   # disarm any pending /backup waiter
-
-    def _snapshot(self):
-        """Current-request state as dict. Caller must hold self._lock."""
-        if not self.enabled:
-            return {
-                'enabled': False, 'secret_key': None,
-                'start_timestamp': None, 'end_timestamp': None,
-                'exfiltrated_data_packets': None, 'rhythm': None,
-                'src': self.src, 'dest': self.dest,
-            }
-        return {
-            'enabled':                    True,
-            'secret_key':                 self.secret_key,
-            'start_timestamp':            self.start_timestamp,
-            'end_timestamp':              self.end_timestamp,
-            'exfiltrated_data_packets':   self._total_packets,
-            'rhythm':                     list(self._rhythm),
-            'src':                        self.src,
-            'dest':                       self.dest,
-            'short_delay_ms':             self.short_delay_s * 1000,
-            'long_delay_ms':              self.long_delay_s  * 1000,
-        }
-
-    def new_session(self, timestamp, attacker_ip=None, dest=None):
-        """Start timing for a new TOS-marked TCP connection.
-
-        Finalizes any active session into _sessions, then resets and arms
-        a fresh entry. One entry per distinct attacker TCP connection.
-        """
-        with self._lock:
-            if self.enabled:
-                if self._total_packets == 0 and not self._rhythm:
-                    print(
-                        f'[TIMING WARN] new_session() displaced a zero-packet '
-                        f'session (src={self.src}). Two distinct TOS connections '
-                        'arrived during one exfil — the attacker host is likely '
-                        'also an NPC host. Upgrade to socket-level TOS marking.',
-                        file=sys.stderr, flush=True,
-                    )
-                self._sessions.append(self._snapshot())
-            self._reset_state()
-            self.enabled          = True
-            self.start_timestamp  = timestamp
-            if attacker_ip:
-                self.src = attacker_ip
-            if dest:
-                self.dest = dest
-            _WM_ARMED.set()   # unblock /backup handler — session is live
-
-    def observe_first_request(self, now, src=None, dest=None):
-        with self._lock:
-            if self.start_timestamp is None:
-                self.start_timestamp = now
-            if src and not self.src:
-                self.src = src
-            if dest and not self.dest:
-                self.dest = dest
-
-    def record_end(self):
-        """Record timestamp of last exfiltrated data packet dispatch."""
-        if self.enabled:
-            with self._lock:
-                self.end_timestamp = time.time()
-
-    def record_data_packet(self):
-        if self.enabled:
-            with self._lock:
-                self._total_packets += 1
-
-    def next_delay_seconds(self):
-        if not self.enabled:
-            return 0.0
-        with self._lock:
-            if not self._pool:
-                self._pool = list(self._fixed_bits)   # cycle same 512 bits
-            bit = self._pool.pop(0)
-            self._rhythm.append(bit)
-        return self.short_delay_s if bit == 0 else self.long_delay_s
-
-    def to_dict(self):
-        with self._lock:
-            return self._snapshot()
-
-    def to_dict_list(self):
-        """All sessions: finalized ones + current active (if any)."""
-        with self._lock:
-            result = list(self._sessions)
-            if self.enabled:
-                result.append(self._snapshot())
-            return result
-
-    def finalize_session(self):
-        """Finalize active request: archive snapshot, reset enabled=False.
-
-        Called by TOS sniffer on FIN/RST — by this point all /backup chunks have
-        been sent (FIN arrives only after TCP stream completes). Writing timing
-        metadata here gives capture_manager the correct packets + rhythm counts.
-        """
-        with self._lock:
-            if self.enabled:
-                self.end_timestamp = time.time()   # stamp before snapshot
-                snap = self._snapshot()
-                self._sessions.append(snap)
-                _log('TIMING', f'session finalized — src={snap.get("src")} '
-                     f'pkts={snap.get("exfiltrated_data_packets")} '
-                     f'rhythm_len={len(snap.get("rhythm") or [])} '
-                     f'end_ts={snap.get("end_timestamp")}')
-            self._reset_state()
-        _persist_timing_metadata()   # write AFTER session fully finalized
+def _finalize_session():
+    """Snapshot _wm session into _all_sessions and persist. Called on FIN/RST."""
+    if not _wm.is_armed():
+        return
+    snap = _wm.session_snapshot()
+    snap['end_timestamp'] = time.time()
+    with _sess_lock:
+        _all_sessions.append(snap)
+    _log('SNIFFER', f'session finalized — attacker={snap["attacker_ip"]} '
+         f'pkts={snap["exfiltrated_data_packets"]} '
+         f'rhythm_len={len(snap["rhythm"])} '
+         f'end_ts={snap["end_timestamp"]:.3f}')
+    _wm.disarm()
+    _persist_timing_metadata()
 
 
-TIMING = TimingProtocol(secret_key=TIMING_SECRET, short_delay_ms=TIMING_SHORT_MS, long_delay_ms=TIMING_LONG_MS)
+def _reset_session():
+    """Clear all per-session state. Called between experiments via /timing/reset."""
+    global _active_sport, _all_sessions
+    if _wm:
+        _wm.reset()
+    with _sess_lock:
+        _all_sessions  = []
+        _active_sport  = None
 
-# Tracks the source port of the most recently seen TOS-marked connection.
-# Defined at module level so TimingProtocol.reset() can clear it regardless
-# of whether TIMING_ENABLED is True.
-_active_sport = None
 
-# ── TOS sniffer — one new_session() per distinct attacker TCP connection ───────
+# ── TOS sniffer — calls _wm.arm() on SYN, _finalize_session() on FIN/RST ─────
 if TIMING_ENABLED:
     try:
         from scapy.all import sniff as _sniff, IP as _IP, TCP as _TCP
         _log('SNIFFER', f'starting TOS sniffer — watching tcp dst port {PORT} '
              f'for TOS=0x{ATTACK_TOS:02x}')
 
-        _active_sport = None
-
         def _tos_sniffer():
             global _active_sport
+
             def _inspect(pkt):
                 global _active_sport
                 if not pkt.haslayer(_IP) or not pkt.haslayer(_TCP):
                     return
-                ip_layer  = pkt[_IP]
-                tcp_layer = pkt[_TCP]
-                flags     = tcp_layer.flags
-                src_ip    = ip_layer.src
-                is_fin_or_rst = bool(int(flags) & 0x05)  # FIN=0x01 or RST=0x04
+                ip_layer      = pkt[_IP]
+                tcp_layer     = pkt[_TCP]
+                flags         = tcp_layer.flags
+                src_ip        = ip_layer.src
+                is_fin_or_rst = bool(int(flags) & 0x05)   # FIN=0x01, RST=0x04
 
-                # ── DISARM first: FIN/RST on the active connection ────────────
-                # Must be checked independently — not elif — because TOS=0x10 is
-                # set at socket level and appears on FIN packets too. An elif on
-                # the TOS-ARM block would silently drop every FIN and never call
-                # finalize_session(), leaving rhythm=[] and enabled=True forever.
-                if (tcp_layer.dport == PORT and _active_sport is not None
-                        and tcp_layer.sport == _active_sport and is_fin_or_rst):
+                # ── DISARM: FIN/RST on active connection ──────────────────────
+                # Checked independently — TOS=0x10 is set at socket level so
+                # FIN packets also carry it; without this check every FIN silently
+                # falls through to ARM and creates a duplicate session entry.
+                if (tcp_layer.dport == PORT
+                        and _active_sport is not None
+                        and tcp_layer.sport == _active_sport
+                        and is_fin_or_rst):
                     flag_name = 'FIN' if int(flags) & 0x01 else 'RST'
-                    _log('SNIFFER', f'{flag_name} from {src_ip}:{tcp_layer.sport} — '
-                         'finalize_session')
+                    _log('SNIFFER', f'{flag_name} from {src_ip}:{tcp_layer.sport} '
+                         '— finalizing session')
                     _active_sport = None
-                    TIMING.finalize_session()
-                    return   # FIN/RST — done, don't ARM
+                    _finalize_session()
+                    return
 
                 # ── ARM: TOS-marked SYN on DB port ───────────────────────────
-                # Only match SYN (flag bit 0x02). Requiring SYN prevents the
-                # final TCP ACK (TOS=0x10, sport=same, not FIN) that arrives
-                # after the FIN handshake from re-triggering new_session()
-                # and creating a duplicate session entry in schema.json.
-                if (ip_layer.tos == ATTACK_TOS and tcp_layer.dport == PORT
-                        and TIMING_GATE and not is_fin_or_rst
-                        and bool(int(flags) & 0x02)):   # SYN flag required
+                # SYN flag (0x02) required — prevents the post-FIN ACK from
+                # re-arming a new session and creating a duplicate schema entry.
+                if (ip_layer.tos == ATTACK_TOS
+                        and tcp_layer.dport == PORT
+                        and TIMING_GATE
+                        and not is_fin_or_rst
+                        and bool(int(flags) & 0x02)):
                     sport = tcp_layer.sport
                     if sport != _active_sport:
                         _active_sport = sport
-                        _log('SNIFFER', f'TOS=0x{ATTACK_TOS:02x} detected from '
-                             f'{src_ip}:{sport} — new_session')
-                        TIMING.new_session(
-                            timestamp=float(pkt.time),
-                            attacker_ip=src_ip,
-                            dest=f'{ip_layer.dst}:{PORT}',
-                        )
-            _sniff(
-                filter=f'tcp dst port {PORT}',
-                prn=_inspect, store=False,
-            )
+                        _log('SNIFFER', f'TOS=0x{ATTACK_TOS:02x} SYN from '
+                             f'{src_ip}:{sport} — arming session')
+                        _wm.arm(attacker_ip=src_ip, start_ts=float(pkt.time))
+
+            _sniff(filter=f'tcp dst port {PORT}', prn=_inspect, store=False)
 
         _threading.Thread(target=_tos_sniffer, daemon=True).start()
         _log('SNIFFER', 'TOS sniffer thread started')
     except Exception as _se:
         _log('SNIFFER_ERR', f'TOS sniffer failed to start: {_se}')
 
-# Watermark delays are now injected in the /backup HTTP handler (application layer).
-# No NFQUEUE or nftables required — delays applied via clock_nanosleep between chunk writes.
-
 
 def _persist_timing_metadata():
+    """Write all finalized sessions (+ active if in-progress) to disk."""
     try:
-        sessions = TIMING.to_dict_list()
+        with _sess_lock:
+            sessions = list(_all_sessions)
+        # Include active session if data has been sent but FIN not yet seen
+        if _wm and _wm.is_armed():
+            snap = _wm.session_snapshot()
+            if snap.get('exfiltrated_data_packets', 0) > 0:
+                sessions.append(snap)
         with open(TIMING_META_PATH, 'w', encoding='utf-8') as fh:
             json.dump({'sessions': sessions}, fh)
         _log('META', f'timing metadata written — {len(sessions)} session(s)')
@@ -371,36 +289,24 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get('Content-Length', 0))
         return json.loads(self.rfile.read(n)) if n else {}
 
-    def _observe_request(self):
-        src_ip = self.client_address[0] if self.client_address else None
-        try:
-            local_ip = self.connection.getsockname()[0]
-        except Exception:
-            local_ip = None
-        dest = f'{local_ip}:{PORT}' if local_ip else f'0.0.0.0:{PORT}'
-        TIMING.observe_first_request(time.time(), src=src_ip, dest=dest)
-
     def do_GET(self):
-        self._observe_request()
         p = self._parts()
         if not p or p[0] == 'health':
             self._json(200, {'status': 'ok', 'db': DB, 'port': PORT})
             _persist_timing_metadata()
             return
 
-        # /backup — stream SQLite backup in fixed 512B chunks.
-        # Each chunk is written then held for a watermark delay (20ms or 50ms)
-        # derived from the precomputed SHA-512 bit stream of the secret key.
-        # Delays applied here (application layer) — no nftables or NFQUEUE needed.
+        # /backup — stream SQLite backup in 512B chunks with watermark delays.
+        # Delays are applied AFTER each chunk write so IPD_i = delay_i = f(bit_i).
+        # Rhythm precomputed at startup; sniffer arms _WM_ARMED on TOS SYN.
         if p[0] == 'backup':
-            # Wait up to 500ms for TOS sniffer to call new_session().
-            # SYN always precedes GET, but the sniffer runs in a separate thread
-            # and may not be scheduled immediately. This wait ensures enabled=True
-            # and start_timestamp are set before we start watermarking.
+            # SYN always precedes GET, but the sniffer runs in a separate thread.
+            # Wait up to 500ms to guarantee arm() has been called and attacker_ip set.
+            # If exfil=off (no TOS SYN ever arrives), proceed without watermark.
             if TIMING_ENABLED:
-                armed = _WM_ARMED.wait(timeout=0.5)
+                armed = _wm.wait_armed(timeout=0.5)
                 if not armed:
-                    _log('BACKUP', 'WARNING — TOS session not detected in 500ms; '
+                    _log('BACKUP', 'WARNING — TOS SYN not detected in 500ms; '
                          'watermark skipped (exfil=off or TOS not set)')
             backup_path = f'/tmp/.app_state_{PORT}.db'
             try:
@@ -412,53 +318,57 @@ class Handler(BaseHTTPRequestHandler):
                 with open(backup_path, 'rb') as f:
                     data = f.read()
                 n_chunks = (len(data) + _WM_CHUNK - 1) // _WM_CHUNK
+                wm_active = TIMING_ENABLED and _wm.is_armed() and TIMING_GATE
                 _log('BACKUP', f'sending {len(data)}B in {n_chunks} chunks — '
-                     f'watermark {"ON" if (TIMING_ENABLED and TIMING.enabled) else "OFF"}')
+                     f'watermark {"ON" if wm_active else "OFF"}')
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/octet-stream')
                 self.send_header('Content-Disposition',
                                  f'attachment; filename="{os.path.basename(DB)}"')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
-                # Disable Nagle — each flush must produce exactly one TCP segment
-                # so each chunk maps to exactly one observable inter-packet delay.
+                # Disable Nagle — each flush produces exactly one TCP segment so
+                # each chunk maps to exactly one observable inter-packet delay.
                 try:
                     self.connection.setsockopt(
                         socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 except Exception:
                     pass
-                wm_active = TIMING_ENABLED and TIMING.enabled and TIMING_GATE
                 chunk_offsets = list(range(0, len(data), _WM_CHUNK))
-                for idx, i in enumerate(chunk_offsets):
-                    chunk = data[i:i + _WM_CHUNK]
-                    # Write + flush FIRST — each flush produces one TCP segment.
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                    TIMING.record_data_packet()   # count every chunk sent
-                    is_last = (idx == len(chunk_offsets) - 1)
-                    if wm_active and not is_last:
-                        # Delay AFTER write: IPD between chunk_i and chunk_{i+1}
-                        # equals this delay, encoding bit_i from the SHA-512 stream.
-                        # Analyzer measures IPD_i and compares with expected_bits[i].
-                        # If delay were before write, IPD_i would encode bit_{i+1}
-                        # causing a systematic off-by-one → survival ≈ 50% always.
-                        delay = TIMING.next_delay_seconds()
-                        bit   = TIMING._rhythm[-1] if TIMING._rhythm else '?'
-                        _log('WM', f'chunk {idx+1}/{n_chunks}  '
-                             f'len={len(chunk)}B  bit={bit}  '
-                             f'IPD→next={delay*1000:.1f}ms')
-                        _cns_hold(delay)
+                if _NL_MODE:
+                    # Network-layer: NetWatermark._callback() intercepts each outgoing
+                    # TCP segment and applies the rhythm delay before the kernel sends it.
+                    # This handler just streams — delays and counts are in net_watermarking.py.
+                    for i in chunk_offsets:
+                        self.wfile.write(data[i:i + _WM_CHUNK])
+                        self.wfile.flush()
+                    _log('BACKUP', f'NL stream done — {n_chunks} chunks sent to NFQUEUE')
+                else:
+                    # App-layer: AppWatermark.next_chunk_delay() writes delay AFTER each
+                    # chunk (IPD_i = delay_i = f(bit_i)). Last chunk gets no delay.
+                    # Delay-before-write causes off-by-one → survival ≈ 50% → NOT_DETECTED.
+                    for idx, i in enumerate(chunk_offsets):
+                        chunk   = data[i:i + _WM_CHUNK]
+                        is_last = (idx == len(chunk_offsets) - 1)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if wm_active and not is_last:
+                            delay, bit = _wm.next_chunk_delay()   # sleeps internally
+                            _log('WM', f'chunk {idx+1}/{n_chunks} '
+                                 f'len={len(chunk)}B bit={bit} '
+                                 f'IPD→next={delay*1000:.1f}ms')
+                snap = _wm.session_snapshot()
                 _log('BACKUP', f'transfer complete — '
-                     f'pkts={TIMING._total_packets} rhythm_len={len(TIMING._rhythm)}')
+                     f'pkts={snap["exfiltrated_data_packets"]} '
+                     f'bits_used={len(snap["rhythm"])}')
             except Exception as e:
                 _log('BACKUP_ERR', str(e))
                 self._json(500, {'error': str(e)})
-            # Timing JSON written by finalize_session() when FIN arrives.
+            # Timing JSON is written by _finalize_session() when FIN arrives.
             return
 
         if p[0] != 'api' or len(p) < 2:
             self._json(404, {'error': 'not found'})
-            _persist_timing_metadata()
             return
         table = p[1]
         try:
@@ -472,35 +382,33 @@ class Handler(BaseHTTPRequestHandler):
             c.close()
         except Exception as e:
             self._json(500, {'error': str(e)})
-        _persist_timing_metadata()
 
     def do_POST(self):
-        self._observe_request()
         p = self._parts()
-        # Timing set endpoint — update short/long delay and enabled flag at runtime
+        # /timing/set — update delay values and gate at runtime
         if p and p[0] == 'timing' and len(p) > 1 and p[1] == 'set':
             global TIMING_GATE
             body = self._body()
+            # Update delays directly on _rhythm — both engines read from it.
             if 'short_delay_ms' in body:
-                TIMING.short_delay_s = float(body['short_delay_ms']) / 1000.0
+                _rhythm.short_delay_s = float(body['short_delay_ms']) / 1000.0
             if 'long_delay_ms' in body:
-                TIMING.long_delay_s = float(body['long_delay_ms']) / 1000.0
+                _rhythm.long_delay_s  = float(body['long_delay_ms']) / 1000.0
             if 'enabled' in body:
                 TIMING_GATE = bool(body['enabled'])
                 if not TIMING_GATE:
-                    TIMING.reset()
-                    TIMING.enabled = False
+                    _reset_session()
             self._json(200, {
                 'status': 'ok',
                 'enabled':        TIMING_GATE,
-                'short_delay_ms': TIMING.short_delay_s * 1000,
-                'long_delay_ms':  TIMING.long_delay_s  * 1000,
+                'short_delay_ms': _rhythm.short_delay_s * 1000,
+                'long_delay_ms':  _rhythm.long_delay_s  * 1000,
             })
             return
 
-        # Timing reset endpoint — called between experiment sessions
+        # /timing/reset — clear all session state between experiments
         if p and p[0] == 'timing' and len(p) > 1 and p[1] == 'reset':
-            TIMING.reset()
+            _reset_session()
             try:
                 os.remove(TIMING_META_PATH)
             except FileNotFoundError:
@@ -508,10 +416,9 @@ class Handler(BaseHTTPRequestHandler):
             _persist_timing_metadata()
             self._json(200, {'status': 'reset'})
             return
-        p = self._parts()
+
         if p[0] != 'api' or len(p) < 2:
             self._json(404, {'error': 'not found'})
-            _persist_timing_metadata()
             return
         table, body = p[1], self._body()
         body.pop('id', None)
@@ -525,14 +432,11 @@ class Handler(BaseHTTPRequestHandler):
             c.close()
         except Exception as e:
             self._json(500, {'error': str(e)})
-        _persist_timing_metadata()
 
     def do_PUT(self):
-        self._observe_request()
         p = self._parts()
         if p[0] != 'api' or len(p) < 3:
             self._json(400, {'error': 'need /api/table/id'})
-            _persist_timing_metadata()
             return
         table, rid, body = p[1], p[2], self._body()
         body.pop('id', None)
@@ -545,14 +449,11 @@ class Handler(BaseHTTPRequestHandler):
             c.close()
         except Exception as e:
             self._json(500, {'error': str(e)})
-        _persist_timing_metadata()
 
     def do_DELETE(self):
-        self._observe_request()
         p = self._parts()
         if p[0] != 'api' or len(p) < 3:
             self._json(400, {'error': 'need /api/table/id'})
-            _persist_timing_metadata()
             return
         table, rid = p[1], p[2]
         try:
@@ -563,7 +464,6 @@ class Handler(BaseHTTPRequestHandler):
             c.close()
         except Exception as e:
             self._json(500, {'error': str(e)})
-        _persist_timing_metadata()
 
 
 if not os.path.exists(TIMING_META_PATH):
@@ -660,11 +560,19 @@ class DatabaseManager:
 
     def _start_api(self, net, db_cfg: DatabaseConfig, db_path: str,
                    exfil_cfg=None) -> None:
-        """Write API server script and run it on the target host."""
+        """Write API server script and watermark modules, then run on target host."""
+        import shutil
         script_path = f"/tmp/api_{db_cfg.host}_{db_cfg.name}.py"
         with open(script_path, "w") as fh:
             fh.write(_API_SCRIPT)
         os.chmod(script_path, 0o755)
+        # Copy watermark modules to /tmp so _API_SCRIPT subprocess can import them.
+        # rhythm_computer  → computes 512 bits from secret_key
+        # app_watermarking → AppWatermark: delays in /backup HTTP handler
+        # net_watermarking → NetWatermark: delays via NFQUEUE before kernel sends
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _mod in ("rhythm_computer.py", "app_watermarking.py", "net_watermarking.py"):
+            shutil.copy(os.path.join(_here, _mod), f"/tmp/{_mod}")
 
         node = net[db_cfg.host]
         tp = getattr(db_cfg, "timing_protocol", None)
@@ -680,10 +588,11 @@ class DatabaseManager:
         # attack_tos from exfiltration config — TOS byte is the sole watermark gate
         timing_tos  = hex(int(getattr(exfil_cfg, "attack_tos", 0x10)))
         timing_meta = f"/tmp/timing_{db_cfg.host}_{db_cfg.name}.json"
+        timing_wm_type = getattr(tp, "watermark_type", "auto")  # net-flow | app-flow | auto
         node.cmd(
             f"python3 {script_path} {db_path} {db_cfg.api_port} "
             f"{1 if timing_enabled else 0} {timing_secret} {timing_meta} "
-            f"{timing_short_ms} {timing_long_ms} {timing_tos} "
+            f"{timing_short_ms} {timing_long_ms} {timing_tos} {timing_wm_type} "
             f"> /tmp/api_{db_cfg.host}_{db_cfg.name}.log 2>&1 &"
         )
         time.sleep(0.5)
@@ -701,6 +610,6 @@ class DatabaseManager:
             )
 
         self._api_ports.setdefault(db_cfg.host, {})[db_cfg.name] = db_cfg.api_port
-        # Application-layer watermarker is embedded in _API_SCRIPT itself.
-        # Scapy TOS sniffer arms _WM_ARMED on SYN detection; /backup handler
-        # injects clock_nanosleep delays between 512B chunk writes.
+        # Watermark engine selected at DB startup: NetWatermark (network-layer via NFQUEUE)
+        # if available, else AppWatermark (app-layer delays in /backup handler).
+        # Both modules are copied to /tmp/ above so the subprocess can import them.

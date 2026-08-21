@@ -639,7 +639,8 @@ TUNNEL        WireGuard (in-kernel) hub-and-spoke
                 ▼
 SERVICES      Flask + SQLite inside the victim namespace
                 ▼
-SIGNAL        timing_protocol.py: SHA-512 → bits → time.sleep(20|50 ms)
+SIGNAL        rhythm_computer.py: SHA-512 → 512 bits (cycles mod 512)
+              app_watermarking.py or net_watermarking.py: clock_nanosleep(20|50 ms)
               + TOS 0x10 marking  ← ground-truth label
                 ▼
 LOAD          npc_manager: one daemon thread per host (http/dns/db/smtp/ftp/bulk)
@@ -690,8 +691,11 @@ before and after each experiment to clear stale namespaces, veths, and OVS bridg
 |---|---|
 | WireGuard (in-kernel) | Encrypts + forwards immediately; no buffering/reordering; ~constant sub-ms overhead. Why the rhythm survives (D10) |
 | Flask + SQLite | Victim service — real HTTP server, real socket, real queries |
-| `timing_protocol.py` | Covert encoder: SHA-512(key:t0:nonce) → 512 bits → per-bit delay |
-| `time.sleep()` | The actual IPD mechanism. Real kernel timer, real slack (~1–2 ms measured) |
+| `rhythm_computer.py` | `WatermarkBitstream`: SHA-512(secret_key) → 512 bits, cycles mod 512 |
+| `app_watermarking.py` | App-layer engine: `clock_nanosleep` between chunk writes in HTTP handler |
+| `net_watermarking.py` | Net-layer engine: NFQUEUE delays outgoing TCP segment before kernel sends it |
+| `timing_protocol.type` | YAML key: `net-flow` / `app-flow` / `auto` selects engine at DB startup |
+| `clock_nanosleep` | Actual IPD mechanism. ±50–200 µs accuracy via librt ABSTIME |
 | TOS byte 0x10 | Ground-truth label in the IP header. Offline labeling only; never a model input |
 | `npc_manager` / `behaviors.py` | Background load, one daemon thread per host. Source of *emergent* queuing and contention |
 

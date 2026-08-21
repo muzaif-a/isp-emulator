@@ -112,8 +112,9 @@ databases:
     timing_protocol:
       enabled: true
       secret_key: insider_secret
-      short_delay_ms: 20
-      long_delay_ms: 50
+      type: auto          # net-flow | app-flow | auto (default)
+      short_delay_ms: 20  # bit=0 IPD (ms)
+      long_delay_ms: 50   # bit=1 IPD (ms)
     tables:
       - name: employees
         rows: 200

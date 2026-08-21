@@ -401,7 +401,6 @@ def run_experiment(combo: Combo) -> bool:
         wait for initial "mininet> " prompt (topology fully initialised)
         manual workflow:
             vpn on|off
-            db start           <- generate synthetic data + start API + arm timing
             npc start          <- per-device intensity from topology YAML npc.hosts
             [sleep _NPC_WARMUP_S]
             capture start
@@ -439,10 +438,7 @@ def run_experiment(combo: Combo) -> bool:
         # ── 1. VPN ────────────────────────────────────────────────────────────
         _cmd(child, f"vpn {combo.vpn}")
 
-        # ── 2. Database — generate synthetic data + start API + arm timing ────
-        _cmd(child, "db start", timeout=30)
-
-        # ── 3. Background NPC traffic (per-device intensity from topology YAML) ─
+        # ── 2. Background NPC traffic (per-device intensity from topology YAML) ─
         _cmd(child, "npc start")
 
         # NPC warmup: threads prime all links before capture starts

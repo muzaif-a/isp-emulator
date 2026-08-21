@@ -525,8 +525,15 @@ npc stop
 
 The timing protocol encodes a secret bit-stream into the inter-packet delays (IPDs)
 of the DB `/backup` HTTP response. The receiver reconstructs the bit-stream from
-observed IPDs without modifying the HTTP payload. No nftables or NFQUEUE required —
-delays are injected in the Python HTTP handler via `clock_nanosleep`.
+observed IPDs without modifying the HTTP payload.
+
+Two watermark modes, selected by `timing_protocol.type` in YAML:
+
+- **`app-flow`** (`AppWatermark`) — delays injected in the Python HTTP handler via `clock_nanosleep` between 512B chunk writes. No kernel dependencies.
+- **`net-flow`** (`NetWatermark`) — nftables NFQUEUE intercepts each outgoing TCP segment before the kernel sends it; Python callback applies the delay then calls `nfpkt.accept()`. Requires `python3-netfilterqueue`, nftables, and root.
+- **`auto`** — tries net-flow first; falls back to app-flow silently if unavailable.
+
+Both modes produce identical observable IPDs at the attacker; analysis in `analyze_watermark.py` is mode-agnostic.
 
 ---
 

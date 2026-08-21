@@ -151,8 +151,9 @@ databases:
     timing_protocol:
       enabled: true
       secret_key: enterprise-company-covert-key
-      short_delay_ms: 20    # bit=0 inter-packet delay — change for Tor/ISP modes
-      long_delay_ms: 50     # bit=1 inter-packet delay — must satisfy: long - short >> max_jitter
+      type: auto            # net-flow | app-flow | auto (default)
+      short_delay_ms: 20    # bit=0 IPD (ms) — change for Tor/ISP modes
+      long_delay_ms: 50     # bit=1 IPD (ms) — must satisfy: long - short >> max_jitter
     tables:
       - name: employees
         rows: 50

@@ -7,12 +7,12 @@ selected:
   # - configs/topology_wan_isp.yaml        # no exfiltration.attacker — exfil auto-skipped
   # - configs/topology.yaml
 
-repeat: 1   # runs per combo — different synthetic data each run (random row values)
+repeat: 3   # runs per combo — different synthetic data each run (random row values)
 
 vpn:
   - on    # WireGuard tunnel active — watermark traverses encrypted VPN
-  # - off   # direct path — no VPN overhead
+  - off   # direct path — no VPN overhead
 
 exfil:
   - on    # TOS-marked /backup GET → application-layer watermark → label=1
-  # - off   # baseline NPC-only capture, no exfil → label=0
+  - off   # baseline NPC-only capture, no exfil → label=0

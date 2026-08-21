@@ -162,6 +162,11 @@ class TimingProtocolConfig:
     secret_key: Optional[str] = None
     short_delay_ms: float = 20.0   # bit=0 inter-packet delay (ms)
     long_delay_ms: float = 50.0    # bit=1 inter-packet delay (ms)
+    # watermark_type controls which engine is used:
+    #   "auto"      — try net-flow (NFQUEUE) first, fall back to app-flow
+    #   "net-flow"  — force network-layer (NFQUEUE); fail if unavailable
+    #   "app-flow"  — force application-layer (/backup sleep loop)
+    watermark_type: str = "auto"
 
 
 @dataclass
@@ -498,6 +503,7 @@ def _parse_databases(raw_dbs: list) -> List[DatabaseConfig]:
                 secret_key=db.get("timing_protocol", {}).get("secret_key"),
                 short_delay_ms=float(db.get("timing_protocol", {}).get("short_delay_ms", 20.0)),
                 long_delay_ms=float(db.get("timing_protocol", {}).get("long_delay_ms", 50.0)),
+                watermark_type=str(db.get("timing_protocol", {}).get("type", "auto")),
             ),
         ))
     return result

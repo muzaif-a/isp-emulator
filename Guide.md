@@ -380,6 +380,7 @@ databases:
     timing_protocol:
       enabled: true
       secret_key: your-real-secret-here   # required — never use a placeholder
+      type: auto          # net-flow | app-flow | auto (default)
       short_delay_ms: 20
       long_delay_ms: 50
     tables:
@@ -412,6 +413,7 @@ databases:
 |-----|------|----------|---------|-------------|
 | `enabled` | bool | no | `false` | Activate timing channel. |
 | `secret_key` | string | **yes if enabled** | — | SHA-512 key for deterministic bit generation. No default — must be explicitly set. |
+| `type` | string | no | `auto` | Watermark engine: `net-flow` (NFQUEUE, requires root + python3-netfilterqueue), `app-flow` (HTTP handler sleep), `auto` (try net-flow, fall back to app-flow). |
 | `short_delay_ms` | float | no | `20.0` | Inter-packet delay for bit=0 (ms). |
 | `long_delay_ms` | float | no | `50.0` | Inter-packet delay for bit=1 (ms). |
 
@@ -1183,6 +1185,7 @@ databases:
     timing_protocol:
       enabled: true
       secret_key: your-real-secret-here
+      type: auto          # net-flow | app-flow | auto (default)
     tables:
       - name: users
         rows: 50
@@ -1475,6 +1478,7 @@ lans:
 timing_protocol:
   enabled: true
   secret_key: your-real-secret-here   # ← required when enabled: true
+  type: auto                           # net-flow | app-flow | auto (default)
 ```
 
 ---
