@@ -1,15 +1,5 @@
 # ISP Network emulator - Topology Configuration
 #
-# Device classes drive TC profile selection in tc_generator.py.
-
-device_classes:
-  s1:      isp_backbone_switch
-  r1:      lan_router
-  r3:      lan_router
-  h2:      lan_host
-  vpnhub:  vpn_concentrator
-  h3:      lan_host
-#
 # Roles:
 #   h2 — attacker  (VPN client, initiates traffic toward h3)
 #   h3 — victim    (runs HTTP server + SQLite DB with timing protocol)
@@ -38,11 +28,16 @@ nodes:
     type: host
 
 links:
-  - [h2, r1]
-  - [r1, s1]
-  - [s1, vpnhub]
-  - [s1, r3]
-  - [r3, h3]
+  - nodes: [h2, r1]
+    tc: {bw: 100, delay: 2ms, jitter: 1ms, loss: 0, max_queue_size: 1000}
+  - nodes: [r1, s1]
+    tc: {bw: 1000, delay: 5ms, jitter: 2ms, loss: 0, max_queue_size: 2000}
+  - nodes: [s1, vpnhub]
+    tc: {bw: 1000, delay: 5ms, jitter: 2ms, loss: 0, max_queue_size: 2000}
+  - nodes: [s1, r3]
+    tc: {bw: 1000, delay: 5ms, jitter: 2ms, loss: 0, max_queue_size: 2000}
+  - nodes: [r3, h3]
+    tc: {bw: 100, delay: 2ms, jitter: 1ms, loss: 0, max_queue_size: 1000}
 
 lan_gateways:
   - r1
@@ -115,31 +110,6 @@ settings:
   vpn_port: 51820
   log_level: "INFO"
 
-# ── TC shaping (TBF+netem) ────────────────────────────────────────────────────
-traffic_control:
-  s1-eth0:     {area: man}
-  s1-eth1:     {area: man}
-  s1-eth2:     {area: man}
-  r1-eth0:     {area: lan}
-  r1-eth1:     {area: man}
-  r3-eth0:     {area: man}
-  r3-eth1:     {area: lan}
-  h2-eth0:     {area: lan}
-  vpnhub-eth0: {area: man}
-  h3-eth0:     {area: lan}
-
-  links:
-    - interfaces: [h2-eth0, r1-eth0]
-      medium: copper
-    - interfaces: [r1-eth1, s1-eth0]
-      medium: fiber
-    - interfaces: [s1-eth1, vpnhub-eth0]
-      medium: fiber
-    - interfaces: [s1-eth2, r3-eth0]
-      medium: fiber
-    - interfaces: [r3-eth1, h3-eth0]
-      medium: copper
-
 # ── Packet Capture Configuration ─────────────────────────────────────────────
 capture:
   automatic: true
@@ -153,26 +123,3 @@ capture:
 
   cleanup:
     enabled: true
-
-  parser:
-    enabled: false
-    endpoint:
-      - network/parserapi/csv_parser.py
-    dir:
-      - dataset/csv
-
-  feature_selector:
-    - network/featureselection/feature_selector.py
-
-  feature_selection:
-    DEVICE:            network/featureselectionapi.py:get_device
-    INTERFACE:         network/featureselectionapi.py:get_interface
-    FRAME_NO:          network/featureselectionapi.py:get_frame_number
-    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
-    SOURCE:            network/featureselectionapi.py:get_source
-    DESTINATION:       network/featureselectionapi.py:get_destination
-    PROTOCOL:          network/featureselectionapi.py:get_protocol
-    LENGTH:            network/featureselectionapi.py:get_length
-    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
-    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
-    INFO:              network/featureselectionapi.py:get_info

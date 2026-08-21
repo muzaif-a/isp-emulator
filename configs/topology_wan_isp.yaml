@@ -35,16 +35,6 @@
 # ── Device classes ─────────────────────────────────────────────────────────────
 # wan_router gives higher processing latency bounds than lan_router,
 # matching real ISP CPE (customer-premises equipment) behavior.
-device_classes:
-  s1:      isp_backbone_switch
-  vpnhub:  vpn_concentrator
-  r1:      wan_router          # Site A CPE
-  r2:      wan_router          # Site B CPE
-  db1:     datacenter_server
-  web1:    datacenter_server
-  h1:      lan_host
-  h2:      lan_host
-
 exfiltration:
   attacker: h1
   target:
@@ -64,7 +54,8 @@ nodes:
     type: host
 
 links:
-  - [s1, vpnhub]
+  - nodes: [s1, vpnhub]
+    tc: {bw: 1000, delay: 5ms, jitter: 2ms, loss: 0, max_queue_size: 2000}
 
 # ── LANs ──────────────────────────────────────────────────────────────────────
 lans:
@@ -155,12 +146,6 @@ databases:
 deployment:
   mode: auto
 
-# ── Firewall ──────────────────────────────────────────────────────────────────
-security:
-  firewall:
-    enabled: false
-    policy: restrictive
-    backend: iptables
 
 # ── Packet capture ────────────────────────────────────────────────────────────
 capture:
@@ -178,33 +163,6 @@ capture:
   cleanup:
     enabled: true
 
-  parser:
-    enabled: false
-    endpoint:
-      - network/parserapi/csv_parser.py
-    dir:
-      - dataset/csv
-
-  feature_selector:
-    - network/featureselection/feature_selector.py
-
-  feature_selection:
-    DEVICE:            network/featureselectionapi.py:get_device
-    INTERFACE:         network/featureselectionapi.py:get_interface
-    FRAME_NO:          network/featureselectionapi.py:get_frame_number
-    TIMESTAMP:         network/featureselectionapi.py:get_timestamp
-    SOURCE:            network/featureselectionapi.py:get_source
-    DESTINATION:       network/featureselectionapi.py:get_destination
-    PROTOCOL:          network/featureselectionapi.py:get_protocol
-    LENGTH:            network/featureselectionapi.py:get_length
-    SOURCE_PORT:       network/featureselectionapi.py:get_source_port
-    DESTINATION_PORT:  network/featureselectionapi.py:get_destination_port
-    TOS:               network/featureselectionapi.py:get_tos
-    IS_ATTACK:         network/featureselectionapi.py:get_is_attack
-    TTL:               network/featureselectionapi.py:get_ttl
-    INFO:              network/featureselectionapi.py:get_info
-
-# ── Network settings ──────────────────────────────────────────────────────────
 settings:
   isp_base_network: "10.0.0.0/8"
   lan_base_network: "192.168.0.0/16"
@@ -228,53 +186,3 @@ settings:
 # Router interfaces:
 #   r1-eth0 → s1 (ISP/WAN side),  r1-eth1 → lss1 (LAN side)
 #   r2-eth0 → s1 (ISP/WAN side),  r2-eth1 → lss2 (LAN side)
-traffic_control:
-  # ISP backbone switch interfaces — isp_enterprise area (high bandwidth ISP links)
-  s1-eth0:     {area: isp_enterprise}   # to vpnhub
-  s1-eth1:     {area: isp_enterprise}   # to r1 (Site A)
-  s1-eth2:     {area: isp_enterprise}   # to r2 (Site B)
-
-  # VPN hub
-  vpnhub-eth0: {area: isp_enterprise}
-
-  # WAN router interfaces — ISP-facing side (wan area: lower bandwidth, higher latency)
-  r1-eth0:     {area: wan}              # Site A WAN uplink
-  r2-eth0:     {area: wan}              # Site B WAN uplink
-
-  # WAN router interfaces — LAN-facing side (isp_access: customer premises speeds)
-  r1-eth1:     {area: isp_access}       # Site A LAN downlink
-  r2-eth1:     {area: isp_access}       # Site B LAN downlink
-
-  # LAN switch interfaces (auto-aliased: lss1 = lan_sw_sitea, lss2 = lan_sw_siteb)
-  lss1-eth0:   {area: isp_access}       # lan_sw_sitea → r1
-  lss1-eth1:   {area: isp_access}       # lan_sw_sitea → db1
-  lss1-eth2:   {area: isp_access}       # lan_sw_sitea → web1
-  lss2-eth0:   {area: isp_access}       # lan_sw_siteb → r2
-  lss2-eth1:   {area: isp_access}       # lan_sw_siteb → h1
-  lss2-eth2:   {area: isp_access}       # lan_sw_siteb → h2
-
-  # Host interfaces
-  db1-eth0:    {area: isp_access}
-  web1-eth0:   {area: isp_access}
-  h1-eth0:     {area: isp_access}
-  h2-eth0:     {area: isp_access}
-
-  links:
-    - interfaces: [s1-eth0, vpnhub-eth0]
-      medium: fiber
-    - interfaces: [s1-eth1, r1-eth0]
-      medium: fiber
-    - interfaces: [s1-eth2, r2-eth0]
-      medium: fiber
-    - interfaces: [r1-eth1, lss1-eth0]
-      medium: copper
-    - interfaces: [r2-eth1, lss2-eth0]
-      medium: copper
-    - interfaces: [lss1-eth1, db1-eth0]
-      medium: fiber
-    - interfaces: [lss1-eth2, web1-eth0]
-      medium: fiber
-    - interfaces: [lss2-eth1, h1-eth0]
-      medium: copper
-    - interfaces: [lss2-eth2, h2-eth0]
-      medium: copper

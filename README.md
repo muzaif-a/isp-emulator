@@ -100,38 +100,26 @@ isp-emulator/
 │   ├── vpn_manager.py            WireGuard deployment orchestrator
 │   ├── vpn_controller.py         Runtime VPN on/off/restart
 │   ├── wireguard.py              WireGuard primitives
-│   ├── capture_manager.py        Packet capture engine
-│   ├── pcapng_reader.py          Minimal PCAPNG parser
-│   ├── featureselectionapi.py    Built-in feature extraction functions
-│   ├── hardware/
-│   │   ├── tc_generator.py       TBF+netem TC command generator
-│   │   └── tc_thresholds.json    Physical parameter bounds
-│   ├── npc/
-│   │   ├── npc_manager.py        NPC traffic orchestrator
-│   │   ├── behaviors.py          Per-protocol behavior implementations
-│   │   └── intensity.py          Behavior weight tables
-│   ├── featureselection/
-│   │   └── feature_selector.py   Feature Selection Engine (subprocess)
-│   ├── featureapi/
-│   │   └── featureapi.py         Alternative feature API (TOS/attack)
-│   ├── parserapi/
-│   │   └── csv_parser.py         CSV serialisation subprocess
-│   └── security/
-│       └── firewall_manager.py   Firewall rule deployment
+│   ├── capture_manager.py        Packet capture engine + schema.json writer
+│   └── npc/
+│       ├── npc_manager.py        NPC traffic orchestrator
+│       ├── behaviors.py          Per-protocol behavior implementations
+│       └── intensity.py          Behavior weight tables
 │
 ├── services/
 │   ├── service_manager.py        Service deployment orchestrator
 │   ├── service_registry.py       Registry of running services
 │   ├── service_discovery.py      Scan for undeclared running services
 │   └── database/
-│       ├── database_manager.py   SQLite deploy + REST API
+│       ├── database_manager.py   SQLite + REST API + application-layer watermark injector
 │       ├── synthetic_data.py     Row generation from schema
 │       ├── generators.py         Per-field synthetic data generators
 │       ├── schema_builder.py     SQLite DDL builder
-│       └── timing_protocol.py    Timing-channel bit generation + metadata
+│       └── timing_protocol.py    Timing-channel config dataclass
 │
 ├── scripts/
 │   ├── auto_gen.py               Experiment automation runner (pexpect)
+│   ├── analyze_watermark.py      IPD-based watermark survival analysis
 │   └── setup.sh                  System dependency installer
 │
 ├── dataset/
@@ -261,24 +249,16 @@ Runtime VPN management. `turn_on()` creates a fresh `VPNManager` and calls `depl
 
 ## 8. Traffic Control Subsystem
 
-`network/hardware/tc_generator.py` — generates Linux `tc` commands for TBF + netem.
+TC parameters are declared in the YAML `traffic_control` section and parsed by `config_loader.py` into `TCParams` dataclasses. Mininet applies them via `TCLink` during `addLink()` — no external tc_generator script.
 
-**Two-layer qdisc per interface:**
-- Root (TBF): enforces bandwidth limit. Parameters: `rate`, `burst` (token bucket), `latency` (queue drain time).
-- Child (netem): adds physical propagation delay only. Parameters: `delay` (base), `jitter` (physical variance), `distribution`.
+**Per-link parameters (all from YAML):**
+- `bw`: bandwidth Mbit/s (TBF token bucket)
+- `delay`: propagation delay string, e.g. `"10ms"` (netem)
+- `jitter`: delay variance string (netem)
+- `loss`: packet loss percentage (netem)
+- `max_queue_size`: txqueue length in packets
 
-**Queuing delay, jitter from load, and packet loss are emergent** — arise from NPC traffic filling the TBF queue. No synthetic impairments injected.
-
-**Parameter computation** (all randomised within physical bounds from `tc_thresholds.json`):
-- Bandwidth: linear interpolation within `link_capacity_mbps[area]` bounds.
-- Propagation delay: `(dist_km / medium_speed_km_per_s) × 1000` ms.
-- Processing delay: linear interpolation within `processing_ms[device_class]` bounds.
-- Infrastructure overhead: linear interpolation within `infrastructure_overhead_ms[area]` bounds.
-- Base delay: sum of above three.
-- Jitter: `max(0.01, infra_ms × uniform(0.02, 0.1))`.
-- TBF limit: `max(20, max(BDP, buffer_packets_sample))`. BDP prevents undersizing on fast high-delay links.
-
-Same seed → identical profile. Default seed: `42` (auto-applied by `capture start` if no prior `apply tc`).
+**Queuing delay and emergent jitter** arise from NPC traffic filling the TBF queue. No random synthetic impairments — all values are deterministic from YAML.
 
 TC commands are recorded per session in `dataset/network_profile.json`.
 
@@ -373,22 +353,9 @@ The sniffer script (embedded in `_SNIFFER_SCRIPT`):
 
 **Automatic pipeline** (when `automatic: true`):
 1. `mergecap -w {out} {inputs}` — falls back to `scapy.PcapReader + wrpcap` if `mergecap` unavailable.
-2. `python3 feature_selector.py {pcapng} {session_id} {yaml}` — returns JSON dataset path via stdout.
-3. `python3 csv_parser.py {json} {session_id} {yaml}` — returns CSV path via stdout.
-4. Upsert `dataset/schema.json`.
-5. `clean()` if `cleanup.enabled`.
-
-### Feature Selection Engine (`network/featureselection/feature_selector.py`)
-
-Subprocess. Reads YAML `feature_selection` mapping, dynamically imports each `module.py:function`, iterates packets from PCAPNG via `PcapNgFile`, builds row dicts, writes `dataset/tmp/{session_id}_session_dataset.json`, prints path to stdout.
-
-### CSV Parser (`network/parserapi/csv_parser.py`)
-
-Subprocess. Reads JSON dataset, reads column order from YAML `feature_selection`, writes CSV in that column order. Returns CSV path via stdout.
-
-### PCAPNG Reader (`network/pcapng_reader.py`)
-
-Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` (IDB option code 2) and timestamp resolution (option code 9). Yields `PcapNgPacket` with `interface_name`, `device` (interface_name split on `-`), and `timestamp_decimal` (full-precision `Decimal`).
+2. Read `/tmp/timing_<host>_<db>.json` — runtime session data (rhythm, packet count, timestamps) written by the DB watermark injector.
+3. Upsert `dataset/schema.json` with merged PCAP path + timing session data.
+4. `clean()` if `cleanup.enabled`.
 
 ---
 
@@ -402,9 +369,9 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 
 **Endpoint selection:** from `exfiltration.endpoints` if set; otherwise `/api/{table_name}` for a random table.
 
-**TOS byte:** from `exfiltration.attack_tos` in YAML (default `0x10`). Same value used by the server sniffer and `featureapi.get_is_attack()` via `ATTACK_TOS` env var.
+**TOS byte:** from `exfiltration.attack_tos` in YAML (default `0x10`). Applied at socket level before `connect()` — all TCP packets on the exfil connection (SYN, data, FIN) carry TOS=0x10.
 
-**Label:** `get_is_attack()` feature function returns `"1"` for packets matching `ATTACK_TOS` — per-packet ground-truth labels in the CSV dataset.
+**Watermark injection:** the DB REST API server (running inside the DB node's network namespace) embeds a scapy TOS sniffer and a watermark injector. On TOS SYN detection: `new_session()` preloads the SHA-512 bitstream. On `GET /backup`: waits for session to arm, sends 512B chunks with `clock_nanosleep` delay after each chunk — delay encodes bit_i from the SHA-512 stream. On FIN: `finalize_session()` snapshots rhythm + packet count to `/tmp/timing_<host>_<db>.json`.
 
 ---
 
@@ -414,46 +381,45 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 
 ```json
 {
-  "session_id": "20260724_004814_216934",
+  "session_id": "20260821_024254_805997",
   "topology": "topology_enterprise.yaml",
-  "url": {
-    "dataset/pcapng": "text/pcapng"
+  "pcapng": "dataset/pcapng/20260821_024254_805997.pcapng",
+  "timing_protocol": {
+    "conf_atc_ip": "192.168.0.3",
+    "victim_ip": "192.168.1.3:9090",
+    "secret_key": "enterprise-company-covert-key",
+    "short_delay_ms": 20.0,
+    "long_delay_ms": 50.0,
+    "sessions": [
+      {
+        "attacker_ip": "172.16.0.2",
+        "start_timestamp": 1787260380.70,
+        "end_timestamp": 1787260381.80,
+        "exfiltrated_data_packets": 20,
+        "rhythm": [1,1,0,0,1,0,1,1,0,1,1,0,0,1,0,1,1,0,1,0]
+      }
+    ]
   },
-  "timing_protocol": [
-    {
-      "enabled": true,
-      "vpn": true,
-      "intensity": "low",
-      "src": "172.16.0.2",
-      "dest": "192.168.1.3:9090",
-      "secret_key": "enterprise-company-covert-key",
-      "start_timestamp": 1784834305.863,
-      "end_timestamp": 1784834308.893,
-      "nonces_used": [1],
-      "exfiltrated_data_packets": 81,
-      "rhythm": [1,1,0,0,1,0,1,1],
-      "short_delay_ms": 20.0,
-      "long_delay_ms": 50.0
-    }
-  ]
+  "experiment": {
+    "vpn": "on",
+    "exfil": "on",
+    "run": 1
+  }
 }
 ```
 
-**Field sources — all real network evidence, nothing hardcoded:**
+**Field sources — all real network evidence:**
 
 | Field | Source |
 |-------|--------|
-| `src` | Actual `pkt[IP].src` from Scapy sniffer on db server |
-| `vpn` | `ipaddress(src) in vpn_subnet` — packet-level evidence |
-| `intensity` | `npc_manager.is_running()` + actual running intensity; `null` if NPC not started |
-| `secret_key` | From `databases[].timing_protocol.secret_key` in YAML |
-| `start_timestamp` | Real `pkt.time` from first TOS-marked packet |
-| `end_timestamp` | Real `time.time()` at last response chunk sent |
-| `rhythm` | Actual bits consumed from SHA-512 keystream |
+| `conf_atc_ip` | Attacker node's LAN IP from `ip_allocator` (ground truth) |
+| `attacker_ip` | Actual `pkt[IP].src` seen by DB scapy sniffer (may be VPN tunnel IP) |
+| `start_timestamp` | Real `pkt.time` from first TOS-marked SYN |
+| `end_timestamp` | Real `time.time()` when FIN arrives and session finalized |
+| `exfiltrated_data_packets` | Count of 512B chunks sent through watermark injector |
+| `rhythm` | Actual bits from SHA-512 keystream consumed during transfer |
 
-`timing_protocol` is an array — one entry per attacker TCP connection. Empty array for baseline captures.
-
-`rhythm` is serialised compact (no spaces inside `[]`).
+`sessions` is an array — one entry per attacker TCP connection. Empty for `exfil=off` captures.
 
 `dataset/network_profile.json` records exact TC commands per session: `[{session_id: {iface: tc_cmd}}]`.
 
@@ -474,7 +440,6 @@ Pure-Python PCAPNG parser. Parses SHB, IDB, EPB, SPB blocks. Extracts `if_name` 
 **Key behaviours:**
 - `node:` and `host:` both accepted as service host key; `node:` takes precedence.
 - `capture.automatic:` supersedes `capture.mode:`.
-- `parser.endpoint` and `feature_selector` accept string or list; first element used.
 - `capture.devices` falls back to top-level `devices:` key.
 - DPID: YAML value normalised to 16 hex digits; if absent, SHA-256(name)[:16] used (deterministic, never zero).
 
@@ -551,7 +516,7 @@ database_manager.deploy_all()  → sqlite3 + Flask API in node namespace
       ↓
 service_manager.deploy_all()   → HTTP/FTP/SMTP/DNS/echo in namespaces
       ↓
-apply tc ──→ tc_generator ──→ tc qdisc add dev ... tbf && netem
+apply tc ──→ TCLink (Mininet) ──→ tc qdisc add ... tbf + netem
                   ↓
            dataset/network_profile.json
       ↓
@@ -569,9 +534,7 @@ exfil ──→ TOS-marked GET ──→ API response with timing delays
       ↓
 capture stop
       ├── mergecap ──→ dataset/pcapng/{session}.pcapng
-      ├── feature_selector.py ──→ dataset/tmp/{session}_dataset.json
-      ├── csv_parser.py ──→ dataset/csv/{session}.csv
-      ├── schema.json ──→ upsert {session_id, url, timing_protocol}
+      ├── schema.json ──→ upsert {session_id, topology, pcapng, timing_protocol, experiment}
       └── clean() ──→ rm dataset/tmp/{session}_*.pcapng
 ```
 

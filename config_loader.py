@@ -165,46 +165,28 @@ class TimingProtocolConfig:
 
 
 @dataclass
-class TCInterfaceConfig:
-    area: str = "lan"
+class TCParams:
+    """Per-link TC parameters passed directly to TCIntf.config()."""
+    bw: float = 10.0              # bandwidth Mbit/s
+    delay: str = "10ms"           # propagation delay (netem string)
+    jitter: str = "2ms"           # delay jitter (netem string)
+    loss: float = 0.0             # packet loss percentage
+    max_queue_size: int = 1000    # txqueue length (packets)
 
-
-@dataclass
-class TCLinkConfig:
-    interfaces: List[str] = field(default_factory=list)
-    medium: str = "fiber"
-
-
-@dataclass
-class TrafficControlConfig:
-    interfaces: Dict[str, "TCInterfaceConfig"] = field(default_factory=dict)
-    links: List["TCLinkConfig"] = field(default_factory=list)
-
-    def get_medium_for_iface(self, iface: str) -> str:
-        for link in self.links:
-            if iface in link.interfaces:
-                return link.medium
-        return "fiber"
+    def to_mininet(self) -> dict:
+        return {
+            "bw":             self.bw,
+            "delay":          self.delay,
+            "jitter":         self.jitter,
+            "loss":           self.loss,
+            "max_queue_size": self.max_queue_size,
+        }
 
 
 @dataclass
 class DeploymentConfig:
     """Deployment mode."""
     mode: str = "auto"   # auto | manual | hybrid
-
-
-@dataclass
-class FirewallConfig:
-    """Firewall settings."""
-    enabled: bool = False
-    policy: str = "restrictive"     # restrictive | permissive
-    backend: str = "iptables"       # iptables | nftables
-
-
-@dataclass
-class SecurityConfig:
-    """Security settings."""
-    firewall: FirewallConfig = field(default_factory=FirewallConfig)
 
 
 @dataclass
@@ -224,35 +206,14 @@ class LinkCapture:
 
 @dataclass
 class CaptureConfig:
-    """Packet capture configuration declared in the 'capture:' YAML section.
-
-    New schema (topology.yaml):
-        capture.automatic         — true|false (replaces mode: automatic|manual)
-        capture.mode              — backward compat alias for automatic
-        capture.sessiondir        — per-interface PCAP staging directory
-        capture.merged            — merged PCAP output folder
-        capture.csv_dir           — CSV output folder
-        capture.parser            — parser endpoints and output dirs
-        capture.feature_selector  — feature selector script(s)
-        capture.feature_selection — column → module:function map
-        capture.cleanup           — cleanup options
-        devices                   — list of Mininet node names
-    """
+    """Packet capture configuration declared in the 'capture:' YAML section."""
     automatic: bool = True
-    mode: str = "automatic"                  # derived from automatic; kept for compat
+    mode: str = "automatic"
     sessiondir: str = "dataset/tmp"
     merged: str = "dataset/pcapng"
-    csv_dir: str = "dataset/csv"
-    feature_selector_endpoint: str = "featureselection/feature_selector.py"   # compat
-    feature_selector_endpoints: List[str] = field(default_factory=list)
-    parser_enabled: bool = True              # set to false to skip pcapng→csv
-    parser_endpoint: str = ""                # compat
-    parser_endpoints: List[str] = field(default_factory=list)
-    parser_dirs: List[str] = field(default_factory=list)
-    schema_update_folder: str = "dataset/pcapng"    # compat
-    schema_mimetype: str = "text/pcapng"            # compat
+    schema_update_folder: str = "dataset/pcapng"
+    schema_mimetype: str = "text/pcapng"
     schema_file: str = "dataset/schema.json"
-    network_profile_file: str = "dataset/network_profile.json"
     cleanup_enabled: bool = False
     devices: List[str] = field(default_factory=list)
 
@@ -276,7 +237,6 @@ class TopologyConfig:
     services: List[ServiceConfig] = field(default_factory=list)
     databases: List[DatabaseConfig] = field(default_factory=list)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
-    security: SecurityConfig = field(default_factory=SecurityConfig)
     vpn_config: VPNConfig = field(default_factory=VPNConfig)
     static_routes: List[StaticRoute] = field(default_factory=list)
     capture_config: CaptureConfig = field(default_factory=CaptureConfig)
@@ -284,7 +244,7 @@ class TopologyConfig:
     npc_hosts:      Dict[str, str] = field(default_factory=dict)
     npc_weights:    Dict[str, Dict[str, int]] = field(default_factory=dict)
     exfiltration:   "ExfiltrationConfig" = field(default_factory=lambda: ExfiltrationConfig())
-    traffic_control: "TrafficControlConfig" = field(default_factory=lambda: TrafficControlConfig())
+    link_tc: Dict[Tuple[str, str], "TCParams"] = field(default_factory=dict)
     attackers:      List[str] = field(default_factory=list)
 
     # ---------------------------------------------------------------- helpers
@@ -372,9 +332,24 @@ def load_config(path: str) -> TopologyConfig:
             raw_dpid = n.get("dpid")
             node.dpid = _normalise_dpid(raw_dpid) if raw_dpid else dpid_from_name(n["name"])
         nodes.append(node)
-    links: List[Tuple[str, str]] = [
-        tuple(lnk) for lnk in raw.get("links", [])  # type: ignore[misc]
-    ]
+    _raw_links = raw.get("links", [])
+    links: List[Tuple[str, str]] = []
+    _link_tc: Dict[Tuple[str, str], "TCParams"] = {}
+    for _lnk in _raw_links:
+        if isinstance(_lnk, (list, tuple)):
+            links.append(tuple(_lnk))  # type: ignore[misc]
+        elif isinstance(_lnk, dict):
+            _nodes = tuple(_lnk["nodes"])  # type: ignore[misc]
+            links.append(_nodes)
+            if "tc" in _lnk:
+                _tc = _lnk["tc"]
+                _link_tc[_nodes] = TCParams(
+                    bw=float(_tc.get("bw", 10.0)),
+                    delay=str(_tc.get("delay", "10ms")),
+                    jitter=str(_tc.get("jitter", "2ms")),
+                    loss=float(_tc.get("loss", 0.0)),
+                    max_queue_size=int(_tc.get("max_queue_size", 1000)),
+                )
 
     raw_settings = raw.get("settings", {})
     settings = Settings(
@@ -413,16 +388,6 @@ def load_config(path: str) -> TopologyConfig:
 
     raw_deploy = raw.get("deployment", {})
     deployment = DeploymentConfig(mode=raw_deploy.get("mode", "auto"))
-
-    raw_sec = raw.get("security", {})
-    raw_fw = raw_sec.get("firewall", {})
-    security = SecurityConfig(
-        firewall=FirewallConfig(
-            enabled=raw_fw.get("enabled", False),
-            policy=raw_fw.get("policy", "restrictive"),
-            backend=raw_fw.get("backend", "iptables"),
-        )
-    )
 
     raw_vpn_cfg = raw.get("vpn", {})
     raw_vpn_server = raw_vpn_cfg.get("server", {})
@@ -471,7 +436,6 @@ def load_config(path: str) -> TopologyConfig:
         services=services,
         databases=databases,
         deployment=deployment,
-        security=security,
         vpn_config=vpn_config,
         static_routes=static_routes,
         capture_config=capture_config,
@@ -482,7 +446,7 @@ def load_config(path: str) -> TopologyConfig:
             for intensity, weights in raw.get("npc", {}).get("weights", {}).items()
         },
         exfiltration=_parse_exfiltration(raw.get("exfiltration", {})),
-        traffic_control=_parse_traffic_control(raw.get("traffic_control", {})),
+        link_tc=_link_tc,
         attackers=list(raw.get("attackers", [])),
     )
 
@@ -510,21 +474,6 @@ def _parse_exfiltration(raw: dict) -> "ExfiltrationConfig":
     )
 
 
-def _parse_traffic_control(raw: dict) -> "TrafficControlConfig":
-    if not raw:
-        return TrafficControlConfig()
-    interfaces: Dict[str, TCInterfaceConfig] = {}
-    links: List[TCLinkConfig] = []
-    for key, val in raw.items():
-        if key == "links":
-            for link_raw in (val or []):
-                ifaces = list(link_raw.get("interfaces", []))
-                medium = link_raw.get("medium", "fiber")
-                links.append(TCLinkConfig(interfaces=ifaces, medium=medium))
-        else:
-            area = val.get("area", "lan") if isinstance(val, dict) else "lan"
-            interfaces[key] = TCInterfaceConfig(area=area)
-    return TrafficControlConfig(interfaces=interfaces, links=links)
 
 
 def _parse_databases(raw_dbs: list) -> List[DatabaseConfig]:
@@ -560,7 +509,6 @@ def _parse_capture_config(raw_capture: dict, raw_devices: list) -> "CaptureConfi
     Supports both old format (mode: automatic) and new format (automatic: true).
     Parser endpoints and feature selector can be a string or a list.
     """
-    # automatic/mode — new key 'automatic' takes precedence over 'mode'
     explicit_automatic = raw_capture.get("automatic")
     if explicit_automatic is not None:
         automatic = bool(explicit_automatic)
@@ -569,82 +517,31 @@ def _parse_capture_config(raw_capture: dict, raw_devices: list) -> "CaptureConfi
         mode = raw_capture.get("mode", "automatic")
         automatic = (mode != "manual")
 
-    # directory defaults
     sessiondir = raw_capture.get("sessiondir", "dataset/tmp").rstrip("/")
     merged = raw_capture.get("merged", "dataset/pcapng").rstrip("/")
 
-    # parser section — endpoint can be string or list; dir can be string or list
-    parser_raw = raw_capture.get("parser") or {}
-    parser_enabled = bool(parser_raw.get("enabled", True))
-    parser_endpoint_raw = parser_raw.get("endpoint", "")
-    if isinstance(parser_endpoint_raw, str) and parser_endpoint_raw.strip():
-        parser_endpoints = [parser_endpoint_raw.strip()]
-    elif isinstance(parser_endpoint_raw, list):
-        parser_endpoints = [e.strip() for e in parser_endpoint_raw if e and str(e).strip()]
-    else:
-        parser_endpoints = []
-
-    parser_dir_raw = parser_raw.get("dir", [])
-    if isinstance(parser_dir_raw, str) and parser_dir_raw.strip():
-        parser_dirs = [parser_dir_raw.strip()]
-    elif isinstance(parser_dir_raw, list):
-        parser_dirs = [d.strip() for d in parser_dir_raw if d and str(d).strip()]
-    else:
-        parser_dirs = []
-
-    csv_dir = parser_dirs[0] if parser_dirs else "dataset/csv"
-
-    # feature_selector — string or list
-    fs_raw = raw_capture.get("feature_selector", "")
-    if isinstance(fs_raw, str) and fs_raw.strip():
-        feature_selector_endpoints = [fs_raw.strip()]
-    elif isinstance(fs_raw, list):
-        feature_selector_endpoints = [e.strip() for e in fs_raw if e and str(e).strip()]
-    else:
-        feature_selector_endpoints = []
-
-    # devices: prefer capture.devices; fall back to top-level devices list
     devices_in_capture = raw_capture.get("devices", []) or []
     devices = list(devices_in_capture) if devices_in_capture else list(raw_devices)
 
-    # cleanup: absent section → don't clean; present section → honour enabled flag
     cleanup_section = raw_capture.get("cleanup")
     if cleanup_section is None:
         cleanup_enabled = False
     else:
-        cleanup_raw = cleanup_section or {}
-        cleanup_enabled = bool(cleanup_raw.get("enabled", True))
+        cleanup_enabled = bool((cleanup_section or {}).get("enabled", True))
 
-    # schema section (backward compat only — url keys are now derived from folder paths)
     schema_raw = raw_capture.get("schema") or {}
     schema_update_folder = schema_raw.get("update_folder", merged)
     schema_mimetype = schema_raw.get("mimetype", "text/pcapng")
     schema_file = schema_raw.get("file", "dataset/schema.json")
-    network_profile_file = schema_raw.get("network_profile", "dataset/network_profile.json")
-
-    # backward compat single-string endpoint fields
-    feature_selector_endpoint = (
-        feature_selector_endpoints[0] if feature_selector_endpoints
-        else "featureselection/feature_selector.py"
-    )
-    parser_endpoint = parser_endpoints[0] if parser_endpoints else ""
 
     return CaptureConfig(
         automatic=automatic,
         mode=mode,
         sessiondir=sessiondir,
         merged=merged,
-        csv_dir=csv_dir,
-        parser_enabled=parser_enabled,
-        feature_selector_endpoint=feature_selector_endpoint,
-        feature_selector_endpoints=feature_selector_endpoints,
-        parser_endpoint=parser_endpoint,
-        parser_endpoints=parser_endpoints,
-        parser_dirs=parser_dirs if parser_dirs else [csv_dir],
         schema_update_folder=schema_update_folder,
         schema_mimetype=schema_mimetype,
         schema_file=schema_file,
-        network_profile_file=network_profile_file,
         cleanup_enabled=cleanup_enabled,
         devices=devices,
     )
@@ -749,8 +646,6 @@ _VALID_GENERATOR_TYPES  = {"integer", "int", "float", "first_name", "last_name",
                            "text", "uuid", "date", "timestamp"}
 _VALID_VPN_MODES        = {"site_to_site", "remote_access", "hybrid"}
 _VALID_DEPLOY_MODES     = {"auto", "manual", "hybrid"}
-_VALID_FW_POLICIES      = {"restrictive", "permissive"}
-_VALID_FW_BACKENDS      = {"iptables", "nftables"}
 _VALID_NPC_INTENSITIES  = {"low", "medium", "high"}
 
 
@@ -854,14 +749,6 @@ def _validate(config: TopologyConfig) -> None:
     if config.deployment.mode not in _VALID_DEPLOY_MODES:
         raise EmulatorError("E035", f"deployment.mode={config.deployment.mode!r}")
 
-    # ── Firewall policy / backend ─────────────────────────────────────────────
-    fw = config.security.firewall
-    if fw.enabled:
-        if fw.policy not in _VALID_FW_POLICIES:
-            raise EmulatorError("E033", f"firewall.policy={fw.policy!r}")
-        if fw.backend not in _VALID_FW_BACKENDS:
-            raise EmulatorError("E034", f"firewall.backend={fw.backend!r}")
-
     # ── Service types and port ranges ─────────────────────────────────────────
     host_ports: Dict[str, set] = {}
     for svc in config.services:
@@ -949,10 +836,6 @@ def _validate(config: TopologyConfig) -> None:
         if dc_node not in names:
             raise EmulatorError("E045",
                 f"device_classes.{dc_node!r} — node not declared in nodes:")
-
-    # ── traffic_control interface names — validated at topology build time ───
-    # TC interface names use Mininet aliases (e.g. 'lss1-eth0' for 'lan_sw_sitea')
-    # which are only computed by ip_allocator. Cannot validate here without allocation.
 
     # ── vpn_peers.clients — no duplicates ─────────────────────────────────────
     for vp in config.vpn_peers:

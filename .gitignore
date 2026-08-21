@@ -1,21 +1,26 @@
-
-# Claude Code local files
+# ── Claude / IDE ──────────────────────────────────────────────────────────────
 .claude/
 .agents/
 skills-lock.json
 
-# Python
+# ── Python runtime ────────────────────────────────────────────────────────────
 __pycache__/
+*.pyc
 .pytest_cache/
 .venv/
-research_stats/
-document/
-tests/*
+
+# ── Mininet audit artifacts (delete with: sudo rm -rf audit/) ─────────────────
+audit/
+audit_namespace.sh
+
+# ── Generated / experiment-specific ──────────────────────────────────────────
 run.sh
 requirements-lock.txt
+
+# Frozen timing constants — never edit, never commit changes
 configs/preregistration.yaml
-docs/
-# Generated datasets
+
+# ── Generated datasets (keep placeholder .gitkeep) ───────────────────────────
 dataset/pcapng/*
 !dataset/pcapng/.gitkeep
 
@@ -25,6 +30,15 @@ dataset/csv/*
 dataset/tmp/*
 !dataset/tmp/.gitkeep
 
-# Generated metadata
-dataset/network_profile.json
+# ── Generated session metadata ────────────────────────────────────────────────
 dataset/schema.json
+dataset/network_profile.json
+dataset/watermark_log.txt
+dataset/watermark_log.jsonl
+
+# ── Runtime temp files ────────────────────────────────────────────────────────
+/tmp/timing_*.json
+/tmp/api_*.log
+/tmp/api_*.py
+/tmp/watermark_debug.log
+/tmp/.app_state_*.db

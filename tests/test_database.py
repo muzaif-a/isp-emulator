@@ -1,0 +1,371 @@
+"""Unit tests for database modules — no Mininet required.
+
+Tests:
+  * generators.py      — field value generation
+  * schema_builder.py  — DDL generation
+  * synthetic_data.py  — row generation
+  * database_manager   — SQLite creation (in /tmp)
+"""
+
+import os
+import sqlite3
+import sys
+import tempfile
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from config_loader import TableConfig, DatabaseConfig
+from services.database.generators import generate
+from services.database.schema_builder import build_create_table, build_indexes, insert_sql, column_sql_type
+from services.database.synthetic_data import generate_rows
+from services.database.timing_protocol import TimingProtocol
+from services.database import database_manager
+
+
+# ------------------------------------------------------------------ generators
+
+class TestGenerators:
+
+    def test_integer_in_range(self):
+        for _ in range(50):
+            v = generate("integer")
+            assert isinstance(v, int) and v > 0
+
+    def test_first_name_string(self):
+        v = generate("first_name")
+        assert isinstance(v, str) and len(v) > 1
+
+    def test_last_name_string(self):
+        v = generate("last_name")
+        assert isinstance(v, str) and len(v) > 1
+
+    def test_email_format(self):
+        ctx = {"first_name": "Alice", "last_name": "Smith"}
+        email = generate("email", ctx)
+        assert "@" in email
+        assert "alice" in email.lower()
+        assert "smith" in email.lower()
+
+    def test_salary_is_float_in_range(self):
+        s = generate("salary")
+        assert isinstance(s, float)
+        assert 28_000 <= s <= 180_000
+
+    def test_price_is_float(self):
+        p = generate("price")
+        assert isinstance(p, float) and p > 0
+
+    def test_boolean(self):
+        vals = {generate("boolean") for _ in range(30)}
+        assert vals == {True, False}
+
+    def test_uuid_format(self):
+        u = generate("uuid")
+        assert len(u) == 36 and u.count("-") == 4
+
+    def test_date_format(self):
+        d = generate("date")
+        parts = d.split("-")
+        assert len(parts) == 3
+        assert len(parts[0]) == 4  # year
+
+    def test_unknown_type_fallback(self):
+        v = generate("completely_unknown_type")
+        assert isinstance(v, str)
+
+    def test_department_from_list(self):
+        d = generate("department")
+        assert isinstance(d, str) and len(d) > 0
+
+    def test_product_from_list(self):
+        p = generate("product")
+        assert isinstance(p, str) and len(p) > 0
+
+
+# ------------------------------------------------------------------ schema builder
+
+class TestSchemaBuilder:
+
+    def test_build_create_table_has_id_pk(self):
+        t = TableConfig(
+            name="users",
+            rows=5,
+            schema={"id": "integer", "name": "first_name"},
+        )
+        ddl = build_create_table(t)
+        assert "CREATE TABLE IF NOT EXISTS users" in ddl
+        assert "PRIMARY KEY" in ddl
+        assert "id" in ddl
+
+    def test_build_create_table_auto_id_if_missing(self):
+        t = TableConfig(name="items", rows=5, schema={"title": "text"})
+        ddl = build_create_table(t)
+        assert "id INTEGER PRIMARY KEY" in ddl
+
+    def test_column_sql_types(self):
+        assert column_sql_type("integer") == "INTEGER"
+        assert column_sql_type("salary") == "REAL"
+        assert column_sql_type("boolean") == "INTEGER"
+        assert column_sql_type("first_name") == "TEXT"
+
+    def test_build_indexes(self):
+        t = TableConfig(
+            name="employees", rows=10,
+            schema={"id": "integer", "email": "email"},
+            indexes=["email"],
+        )
+        stmts = build_indexes(t)
+        assert len(stmts) == 1
+        assert "CREATE INDEX" in stmts[0]
+        assert "employees" in stmts[0]
+        assert "email" in stmts[0]
+
+    def test_insert_sql_parameterised(self):
+        stmt = insert_sql("users", ["name", "email"])
+        assert "INSERT INTO users" in stmt
+        assert "?" in stmt
+        assert stmt.count("?") == 2
+
+
+# ------------------------------------------------------------------ synthetic data
+
+class TestSyntheticData:
+
+    def _make_table(self, rows: int = 10) -> TableConfig:
+        return TableConfig(
+            name="employees",
+            rows=rows,
+            schema={
+                "id": "integer",
+                "first_name": "first_name",
+                "last_name": "last_name",
+                "email": "email",
+                "department": "department",
+                "salary": "salary",
+            },
+        )
+
+    def test_row_count(self):
+        t = self._make_table(rows=25)
+        rows = generate_rows(t)
+        assert len(rows) == 25
+
+    def test_ids_sequential(self):
+        rows = generate_rows(self._make_table(rows=10))
+        ids = [r["id"] for r in rows]
+        assert ids == list(range(1, 11))
+
+    def test_all_columns_present(self):
+        t = self._make_table(rows=5)
+        for row in generate_rows(t):
+            for col in t.schema:
+                assert col in row, f"Missing column: {col}"
+
+    def test_emails_contain_at(self):
+        rows = generate_rows(self._make_table(rows=10))
+        for row in rows:
+            assert "@" in row["email"]
+
+    def test_salaries_numeric(self):
+        rows = generate_rows(self._make_table(rows=10))
+        for row in rows:
+            assert isinstance(row["salary"], float)
+
+    def test_zero_rows(self):
+        t = TableConfig(name="empty", rows=0, schema={"id": "integer"})
+        rows = generate_rows(t)
+        assert rows == []
+
+
+# ------------------------------------------------------------------ database creation
+
+class TestDatabaseCreation:
+    """Create a real SQLite DB in /tmp and verify it."""
+
+    def _make_db_config(self, path: str) -> DatabaseConfig:
+        return DatabaseConfig(
+            host="test_host",
+            name="testdb",
+            engine="sqlite",
+            tables=[
+                TableConfig(
+                    name="employees",
+                    rows=20,
+                    schema={
+                        "id": "integer",
+                        "first_name": "first_name",
+                        "last_name": "last_name",
+                        "email": "email",
+                        "salary": "salary",
+                    },
+                    indexes=["email"],
+                ),
+                TableConfig(
+                    name="products",
+                    rows=10,
+                    schema={
+                        "id": "integer",
+                        "product_name": "product",
+                        "price": "price",
+                    },
+                ),
+            ],
+        )
+
+    def test_create_and_populate_db(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = tmp.name
+
+        try:
+            db_cfg = self._make_db_config(db_path)
+            conn = sqlite3.connect(db_path)
+
+            from services.database.schema_builder import build_create_table, build_indexes, insert_sql
+            from services.database.synthetic_data import generate_rows
+
+            for table in db_cfg.tables:
+                conn.execute(build_create_table(table))
+                for idx in build_indexes(table):
+                    conn.execute(idx)
+                rows = generate_rows(table)
+                non_id = [c for c in rows[0].keys() if c != "id"] if rows else []
+                stmt = insert_sql(table.name, non_id)
+                conn.executemany(stmt, [[r[c] for c in non_id] for r in rows])
+
+            conn.commit()
+
+            # Verify counts
+            emp_count = conn.execute("SELECT COUNT(*) FROM employees").fetchone()[0]
+            prod_count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+            assert emp_count == 20, f"Expected 20 employees, got {emp_count}"
+            assert prod_count == 10, f"Expected 10 products, got {prod_count}"
+
+            # Verify schema
+            cur = conn.execute("PRAGMA table_info(employees)")
+            col_names = [row[1] for row in cur.fetchall()]
+            assert "first_name" in col_names
+            assert "email" in col_names
+            assert "salary" in col_names
+
+            conn.close()
+        finally:
+            os.unlink(db_path)
+
+
+class TestTimingProtocol:
+
+    @pytest.mark.parametrize("short_ms,long_ms", [
+        (20.0, 50.0),
+        (10.0, 30.0),
+        (5.0, 100.0),
+        (1.0, 2.0),
+    ])
+    def test_delays_within_configured_bounds(self, short_ms, long_ms):
+        tp = TimingProtocol(
+            enabled=True,
+            secret_key="unit-test-key",
+            short_delay_ms=short_ms,
+            long_delay_ms=long_ms,
+        )
+        tp.observe_first_request(1000.0, src="10.0.0.2", dest="10.0.0.3:9090")
+        for _ in range(20):
+            d = tp.next_delay_seconds()
+            assert d in (short_ms / 1000.0, long_ms / 1000.0), (
+                f"delay {d}s not in expected set "
+                f"({short_ms/1000.0}, {long_ms/1000.0})"
+            )
+
+    def test_disabled_protocol_keeps_src_dest_only(self):
+        tp = TimingProtocol(enabled=False)
+        tp.observe_first_request(1000.0, src="192.168.0.2", dest="192.168.1.3:9090")
+        md = tp.metadata()
+        assert md.enabled is False
+        assert md.secret_key is None
+        assert md.start_timestamp is None
+        assert md.total_data_packets is None
+        assert md.rhythm is None
+        assert md.src == "192.168.0.2"
+        assert md.dest == "192.168.1.3:9090"
+
+    def test_enabled_protocol_tracks_bits_and_counts(self):
+        # Secret key must come from config — not a placeholder.
+        # Use a real test key that is distinct from any placeholder value.
+        test_key = "test-timing-key-for-unit-test"
+        short_ms, long_ms = 20.0, 50.0
+        tp = TimingProtocol(
+            enabled=True,
+            secret_key=test_key,
+            short_delay_ms=short_ms,
+            long_delay_ms=long_ms,
+        )
+        src_ip = "192.168.0.2"
+        dest = "192.168.1.3:9090"
+        tp.observe_first_request(2000.0, src=src_ip, dest=dest)
+        d1 = tp.next_delay_seconds()
+        d2 = tp.next_delay_seconds()
+        tp.record_data_packet()
+        tp.record_data_packet()
+        md = tp.metadata()
+
+        # Delays must be exactly short or long (from config values, not hardcoded)
+        assert d1 in (short_ms / 1000.0, long_ms / 1000.0)
+        assert d2 in (short_ms / 1000.0, long_ms / 1000.0)
+        assert md.enabled is True
+        assert md.secret_key == test_key
+        assert md.start_timestamp == 2000.0
+        assert md.src == src_ip
+        assert md.dest == dest
+        assert len(md.rhythm) == 2
+        assert md.total_data_packets == 2
+
+
+class TestApiTimingPlacement:
+
+    def test_application_layer_watermark(self):
+        # Application-layer watermark: scapy TOS sniffer arms _WM_ARMED event,
+        # /backup handler waits for it then injects clock_nanosleep delays between
+        # 512B chunk writes. No nftables or NFQUEUE required.
+        script = database_manager._API_SCRIPT
+        # _WM_ARMED event replaces nftables arm/disarm.
+        assert "_WM_ARMED" in script
+        assert "_WM_ARMED.set()" in script
+        assert "_WM_ARMED.clear()" in script
+        # Kernel-clock hold injects inter-chunk delays.
+        assert "clock_nanosleep" in script
+        assert "_cns_hold" in script
+        # Chunk-based write with TCP_NODELAY for one-segment-per-chunk.
+        assert "_WM_CHUNK" in script
+        assert "TCP_NODELAY" in script
+        # Timing rhythm still drives delays.
+        assert "TIMING.next_delay_seconds()" in script
+        # No nftables or NFQUEUE in the new implementation.
+        assert "_nft_arm" not in script
+        assert "nfpkt.accept()" not in script
+
+    def test_index_created(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            db_path = tmp.name
+
+        try:
+            table = TableConfig(
+                name="users",
+                rows=5,
+                schema={"id": "integer", "email": "email"},
+                indexes=["email"],
+            )
+            conn = sqlite3.connect(db_path)
+            from services.database.schema_builder import build_create_table, build_indexes
+            conn.execute(build_create_table(table))
+            for idx in build_indexes(table):
+                conn.execute(idx)
+            conn.commit()
+
+            indexes = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='users'"
+            ).fetchall()
+            idx_names = [i[0] for i in indexes]
+            assert any("email" in n for n in idx_names), f"Email index missing: {idx_names}"
+            conn.close()
+        finally:
+            os.unlink(db_path)

@@ -2,30 +2,26 @@
 
 Two modes
 ---------
-  automatic — capture stop triggers the full pipeline automatically.
+  automatic — capture stop triggers merge + schema.json update automatically.
   manual    — user controls every stage via CLI commands.
 
 Automatic workflow (automatic: true in YAML):
     capture start → traffic → capture stop
-    (stop → merge PCAPNG → feature selection → CSV → schema.json → cleanup)
+    (stop → merge PCAPNG → schema.json → cleanup)
 
 Manual workflow (automatic: false in YAML):
     capture start → traffic → capture stop          (schema: pcapng url only)
     capture merge <file1> ... <session_id>          (merge to dataset/pcapng/)
-    capture parsetocsv <pcapng_filename>            (CSV + schema csv url added)
 
 File format: PCAPNG throughout.
   dataset/tmp/     — per-interface PCAPNG: <session_id>_<device>_<iface>.pcapng
   dataset/pcapng/  — merged PCAPNG: <session_id>.pcapng
-  dataset/csv/     — parsed CSV: <session_id>.csv
   dataset/schema.json — session registry
 
 Components
 ----------
-  Capture Engine           — this file
-  Feature Selection Engine — featureselection/feature_selector.py
-  CSV Parser               — parserapi/csv_parser.py
-  Session Registry         — dataset/schema.json
+  Capture Engine   — this file
+  Session Registry — dataset/schema.json
 """
 
 import glob
@@ -50,8 +46,7 @@ from errors import EmulatorError
 
 logger = logging.getLogger(__name__)
 
-_ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SENTINEL = object()  # distinct from None — means "snapshot not yet taken"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class CaptureManager:
@@ -84,8 +79,6 @@ class CaptureManager:
 
         self._npc_manager = None          # set via set_npc_manager()
         self._vpn_controller = None       # set via set_vpn_controller()
-        self._tc_commands: Dict[str, str] = {}
-        self._npc_intensity_snapshot = _SENTINEL  # reset each stop()
 
         # Ensure required directories exist
         self._ensure_dirs()
@@ -98,32 +91,6 @@ class CaptureManager:
     def set_vpn_controller(self, vpn_controller) -> None:
         self._vpn_controller = vpn_controller
 
-    def set_tc_profile(self, commands: Dict[str, str]) -> None:
-        self.teardown_tc()   # remove old rules before applying new profile
-        self._tc_commands = dict(commands)
-        # network_profile.json is written only at capture start, not here
-
-    def teardown_tc(self) -> None:
-        """Remove all active TC rules (called on apply tc override or topology stop)."""
-        if not self._tc_commands or not self.net:
-            return
-        for iface in self._tc_commands:
-            alias = iface.rsplit("-eth", 1)[0]
-            node_name = self.allocation.get_node_for_alias(alias)
-            try:
-                proc = self.net[node_name].popen(
-                    f"tc qdisc del dev {iface} root 2>/dev/null || true",
-                    shell=True,
-                )
-                proc.communicate()
-            except Exception:
-                pass
-        print(
-            f"[CAPTURE] TC rules removed from {len(self._tc_commands)} interface(s).",
-            flush=True,
-        )
-        self._tc_commands = {}
-
     def start(self) -> int:
         """Generate session ID, discover interfaces, start AsyncSniffer per interface."""
         if self._running:
@@ -132,9 +99,6 @@ class CaptureManager:
 
         self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         os.makedirs(self._tmp_dir(), exist_ok=True)
-
-        if self._tc_commands:
-            self._write_network_profile(self._session_id, self._tc_commands)
 
         interfaces = self._discover_interfaces()
         if not interfaces:
@@ -183,11 +147,6 @@ class CaptureManager:
         self._running = False
         time.sleep(0.5)  # allow subprocesses to flush and write
 
-        # Snapshot NPC intensity before stopping — _resolve_npc_intensity() checks
-        # is_running(), so intensity must be captured while NPC threads are live.
-        self._npc_intensity_snapshot = _SENTINEL   # clear any previous session snapshot
-        self._npc_intensity_snapshot = self._resolve_npc_intensity()
-
         # Stop NPC background traffic
         if self._npc_manager and self._npc_manager.is_running():
             self._npc_manager.stop()
@@ -205,20 +164,12 @@ class CaptureManager:
         if self.cfg.automatic:
             self._run_automatic_pipeline(written)
         else:
-            # Manual mode: write initial schema entry with pcapng URL only.
-            # User may later call 'capture merge' and 'capture parsetocsv'.
             timing_protocol = self._build_runtime_metadata()
-            self._append_schema_record(
-                self._session_id, timing_protocol,
-                url={self.cfg.merged: "text/pcapng"},
-            )
+            self._append_schema_record(self._session_id, timing_protocol)
             print(
-                f"[CAPTURE] Stopped. Use 'capture merge' and 'capture parsetocsv' "
-                f"to complete the pipeline.",
+                f"[CAPTURE] Stopped. Use 'capture merge' to complete the pipeline.",
                 flush=True,
             )
-
-        self._tc_commands = {}
 
         return True
 
@@ -290,40 +241,6 @@ class CaptureManager:
         print(f"[CAPTURE] Merged → {out}", flush=True)
         return out
 
-    def parseToCsv(self, pcap_file: str) -> str:
-        """Run Feature Selection Engine + CSV Parser on a PCAPNG file.
-
-        Input file is resolved in order:
-          1. as-is
-          2. in dataset/pcapng/ (most likely location after merge)
-          3. relative to project root
-
-        Output: dataset/csv/<stem>.csv
-        Updates schema.json: adds 'dataset/csv' URL to the matching session entry.
-        """
-        resolved = self._resolve_pcapng(pcap_file)
-        if not resolved:
-            print(f"[CAPTURE] File not found: {pcap_file}", flush=True)
-            return ""
-
-        if not self.cfg.parser_endpoints:
-            print(
-                "[CAPTURE] No parser configured — add 'parser.endpoint' to YAML capture section.",
-                flush=True,
-            )
-            return ""
-
-        stem = os.path.splitext(os.path.basename(resolved))[0]
-        csv_path = self._run_feature_selection_pipeline(resolved, stem)
-
-        if csv_path and os.path.exists(csv_path):
-            print(f"[CAPTURE] CSV → {csv_path}", flush=True)
-            self._upsert_schema_url(stem, {self.cfg.csv_dir: "text/csv"})
-        else:
-            print("[CAPTURE] CSV generation failed.", flush=True)
-
-        return csv_path or ""
-
     def update(self) -> None:
         """Reload schema configuration from YAML without performing a capture."""
         self.reload_schema_configuration()
@@ -382,7 +299,7 @@ class CaptureManager:
     # ------------------------------------------------------ automatic pipeline
 
     def _run_automatic_pipeline(self, interface_pcapngs: List[str]) -> None:
-        """Full pipeline: merge → feature selection → CSV → schema → cleanup."""
+        """Merge per-interface PCAPNGs, write schema.json, cleanup."""
         if not interface_pcapngs:
             print("[CAPTURE] No interface PCAPNGs — skipping pipeline.", flush=True)
             return
@@ -399,34 +316,12 @@ class CaptureManager:
         # 2. Build metadata for schema
         timing_protocol = self._build_runtime_metadata()
 
-        # 3. Parse to CSV if parser is configured
-        csv_path = None
-        if self.cfg.parser_endpoints:
-            csv_path = self._run_feature_selection_pipeline(merged_path, session_id)
-            if csv_path and os.path.exists(csv_path):
-                print(f"[CAPTURE] CSV → {csv_path}", flush=True)
-            else:
-                print("[CAPTURE] CSV generation failed — skipping CSV schema entry.", flush=True)
-                csv_path = None
+        # 3. Write schema
+        self._append_schema_record(session_id, timing_protocol)
 
-        # 4. Write schema
-        url: Dict = {self.cfg.merged: "text/pcapng"}
-        if csv_path:
-            url[self.cfg.csv_dir] = "text/csv"
-        self._append_schema_record(session_id, timing_protocol, url=url)
-
-        # 5. Cleanup
+        # 4. Cleanup
         if self.cfg.cleanup_enabled:
             self.clean()
-
-    def _run_feature_selection_pipeline(
-        self, pcapng_path: str, session_id: str
-    ) -> Optional[str]:
-        """Run feature selector then parser. Returns CSV path. No schema side effects."""
-        dataset_path = self._run_feature_selector(pcapng_path, session_id)
-        if not dataset_path or not os.path.exists(dataset_path):
-            return None
-        return self._run_parser(dataset_path, session_id)
 
     # ---------------------------------------------------------------- internals
 
@@ -435,7 +330,6 @@ class CaptureManager:
         for rel in [
             self.cfg.sessiondir,
             self.cfg.merged,
-            self.cfg.csv_dir,
             "dataset",
         ]:
             os.makedirs(os.path.join(_ROOT, rel), exist_ok=True)
@@ -454,33 +348,6 @@ class CaptureManager:
 
     def _schema_path(self) -> str:
         return os.path.join(_ROOT, self.cfg.schema_file)
-
-    def _network_profile_path(self) -> str:
-        return os.path.join(_ROOT, self.cfg.network_profile_file)
-
-    def _write_network_profile(self, session_id: str, commands: Dict[str, str]) -> None:
-        """Append or update {session_id: {device: tc_cmd}} in dataset/network_profile.json."""
-        path = self._network_profile_path()
-        records: List[Dict] = []
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    loaded = json.load(fh)
-                if isinstance(loaded, list):
-                    records = loaded
-            except Exception:
-                records = []
-
-        for record in records:
-            if isinstance(record, dict) and session_id in record:
-                record[session_id] = commands
-                break
-        else:
-            records.append({session_id: commands})
-
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(records, fh, indent=2)
-        print(f"[CAPTURE] network_profile.json updated (session={session_id}).", flush=True)
 
     def _resolve_pcapng(self, pcap_file: str) -> Optional[str]:
         """Resolve a PCAPNG filename/path to an absolute path."""
@@ -512,133 +379,67 @@ class CaptureManager:
                     result.append((device_name, name))
         return result
 
-    def _run_feature_selector(self, pcapng_path: str, session_id: str) -> Optional[str]:
-        """Launch Feature Selection Engine with sys.executable."""
-        if not self.cfg.feature_selector_endpoints:
-            print("[CAPTURE] No feature_selector configured — skipping feature extraction.", flush=True)
-            return None
-
-        endpoint_rel = self.cfg.feature_selector_endpoints[0]
-        endpoint = os.path.join(_ROOT, endpoint_rel)
-        if not os.path.exists(endpoint):
-            print(f"[CAPTURE] Feature selector not found: {endpoint}", flush=True)
-            return None
-        try:
-            # Resolve ATTACK_TOS from exfiltration config — attacker-side marking.
-            # featureapi.get_is_attack() must use the same byte as the exfil script.
-            exfil_cfg = getattr(self.config, "exfiltration", None)
-            attack_tos = hex(int(getattr(exfil_cfg, "attack_tos", 0x10)))
-            env = {**os.environ, "ATTACK_TOS": attack_tos}
-
-            proc = subprocess.Popen(
-                [sys.executable, endpoint, pcapng_path, session_id, self._yaml_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-            stdout_data, stderr_data = proc.communicate(timeout=300)
-
-            if stderr_data.strip():
-                for line in stderr_data.splitlines():
-                    print(line, flush=True)
-
-            if proc.returncode != 0:
-                print(
-                    "[CAPTURE] Feature Selection failed — skipping CSV and schema update.",
-                    flush=True,
-                )
-                return None
-
-            lines = [line.strip() for line in stdout_data.splitlines() if line.strip()]
-            return lines[-1] if lines else None
-
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            print("[CAPTURE] Feature selector timed out.", flush=True)
-            return None
-        except Exception as exc:
-            print(f"[CAPTURE] Feature selector exception: {exc}", flush=True)
-            return None
-
-    def _run_parser(self, dataset_path: str, session_id: str) -> Optional[str]:
-        """Launch CSV Parser with sys.executable."""
-        if not self.cfg.parser_enabled:
-            print("[CAPTURE] Parser disabled (parser.enabled: false) — skipping CSV generation.", flush=True)
-            return None
-        if not self.cfg.parser_endpoints:
-            print("[CAPTURE] No parser configured — skipping CSV generation.", flush=True)
-            return None
-
-        endpoint_rel = self.cfg.parser_endpoints[0]
-        endpoint = os.path.join(_ROOT, endpoint_rel)
-        if not os.path.exists(endpoint):
-            print(f"[CAPTURE] Parser not found: {endpoint}", flush=True)
-            return None
-        try:
-            result = subprocess.run(
-                [sys.executable, endpoint, dataset_path, session_id, self._yaml_path],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.stderr.strip():
-                for line in result.stderr.splitlines():
-                    print(f"[PARSER] {line}", flush=True)
-            if result.returncode != 0:
-                print("[CAPTURE] CSV Parser failed — skipping schema update.", flush=True)
-                return None
-            return result.stdout.strip() or None
-        except Exception as exc:
-            print(f"[CAPTURE] Parser exception: {exc}", flush=True)
-            return None
-
     def _build_runtime_metadata(self) -> Dict:
-        """Return timing_protocol object for this session.
+        """Return timing_protocol block for schema.json.
 
-        enabled/vpn/intensity are NOT included — they live in experiment (written
-        by auto_gen.py) so there is no duplication. Every session gets one object:
-        nulls for baseline runs, observed values for exfil runs. One session always
-        produces exactly one timing protocol call.
+        Structure:
+          victim_ip, victim_port       — always present (from topology DB config)
+          attacker_ip                  — topology exfiltration.attacker IP, or null
+          secret_key                   — actual key string from YAML ('' if none)
+          short_delay_ms, long_delay_ms — from YAML timing_protocol section
+          sessions                     — list of runtime exfil sessions detected by
+                                         TOS sniffer; one entry per attacker TCP
+                                         connection. Empty for exfil=off captures.
+                                         Multiple entries when >1 attacker IPs exfil.
+
+        For exfil=off captures sessions=[] and start/end/packets/rhythm are absent.
         """
-        sessions = self._load_timing_protocol_sessions()
+        live_sessions = self._load_timing_protocol_sessions()
 
-        db_cfg = self._primary_database_with_api()
-        tp_cfg = getattr(db_cfg, "timing_protocol", None) if db_cfg else None
-        cfg_short_ms    = float(getattr(tp_cfg, "short_delay_ms", None) or 20.0)
-        cfg_long_ms     = float(getattr(tp_cfg, "long_delay_ms",  None) or 50.0)
-        cfg_key_present = bool(getattr(tp_cfg, "secret_key", None)) if tp_cfg else False
+        db_cfg  = self._primary_database_with_api()
+        tp_cfg  = getattr(db_cfg, "timing_protocol", None) if db_cfg else None
+        cfg_short_ms = float(getattr(tp_cfg, "short_delay_ms", None) or 20.0)
+        cfg_long_ms  = float(getattr(tp_cfg, "long_delay_ms",  None) or 50.0)
+        cfg_secret   = str(getattr(tp_cfg, "secret_key", "") or "")
 
-        if not sessions:
-            return {
-                "src":                      None,
-                "dest":                     None,
-                "secret_key_present":       cfg_key_present,
-                "start_timestamp":          None,
-                "end_timestamp":            None,
-                "nonces_used":              [],
-                "exfiltrated_data_packets": None,
-                "rhythm":                   [],
-                "short_delay_ms":           cfg_short_ms,
-                "long_delay_ms":            cfg_long_ms,
-            }
-
-        db_ip = self.allocation.get_host_ip(db_cfg.host) if db_cfg else None
-        db_port = db_cfg.api_port if db_cfg else None
+        exfil_cfg     = getattr(self.config, "exfiltration", None)
+        attacker_name = getattr(exfil_cfg, "attacker", None)
+        attacker_ip   = self.allocation.get_host_ip(attacker_name) if attacker_name else None
+        db_ip         = self.allocation.get_host_ip(db_cfg.host) if db_cfg else None
+        db_port       = db_cfg.api_port if db_cfg else None
         fallback_dest = f"{db_ip}:{db_port}" if db_ip and db_port else None
 
-        s = sessions[0]
-        _ep = s.get("exfiltrated_data_packets")
+        # Build per-connection session list — one entry per TOS-detected connection.
+        # attacker_ip = IP the DB sniffer saw (may be VPN tunnel IP, not real LAN IP).
+        # Skips sessions where enabled=False (baseline/no-watermark entries).
+        exfil_sessions = []
+        for s in live_sessions:
+            if not s.get("enabled"):
+                continue
+            ep = s.get("exfiltrated_data_packets")
+            exfil_sessions.append({
+                "attacker_ip":              s.get("src"),   # observed IP (VPN or LAN)
+                "start_timestamp":          s.get("start_timestamp"),
+                "end_timestamp":            s.get("end_timestamp"),
+                "exfiltrated_data_packets": ep if ep is not None else 0,
+                "rhythm":                   s.get("rhythm") or [],
+            })
+
+        # victim_ip stored as "IP:port" — single field for easy correlation
+        victim_addr = f"{db_ip}:{db_port}" if db_ip and db_port else db_ip
+
         return {
-            "src":                      s.get("src"),
-            "dest":                     s.get("dest") or fallback_dest,
-            "secret_key_present":       bool(s.get("secret_key")),
-            "start_timestamp":          s.get("start_timestamp") or s.get("timestamp"),
-            "end_timestamp":            s.get("end_timestamp"),
-            "nonces_used":              s.get("nonces_used") or [],
-            "exfiltrated_data_packets": _ep if _ep is not None
-                                        else s.get("total_data_packets"),
-            "rhythm":                   s.get("rhythm") or [],
-            "short_delay_ms":           float(s.get("short_delay_ms") or cfg_short_ms),
-            "long_delay_ms":            float(s.get("long_delay_ms")  or cfg_long_ms),
+            # conf_atc_ip: attacker's REAL configured LAN IP (from topology YAML).
+            # May differ from session attacker_ip when VPN is active
+            # (e.g. conf_atc_ip=192.168.0.3 but observed=172.16.0.2 via WireGuard).
+            # Use for ground-truth evaluation: if model predicts this IP = correct.
+            # null when topology has no exfiltration.attacker defined.
+            "conf_atc_ip":   attacker_ip,
+            "victim_ip":     victim_addr,
+            "secret_key":    cfg_secret,
+            "short_delay_ms": cfg_short_ms,
+            "long_delay_ms":  cfg_long_ms,
+            "sessions":      exfil_sessions,
         }
 
     def _load_timing_protocol_sessions(self) -> List[Dict]:
@@ -663,26 +464,6 @@ class CaptureManager:
             logger.warning("[CAPTURE] Failed reading timing metadata %s: %s", meta_path, exc)
             return []
 
-    def _resolve_npc_intensity(self) -> Optional[str]:
-        """Return actual running NPC intensity, or None if NPC never started.
-
-        Returns snapshot if already captured (called after npc.stop()).
-        Otherwise reads live from running manager.
-        If NPC was not started this session, returns None.
-        """
-        snapshot = getattr(self, "_npc_intensity_snapshot", _SENTINEL)
-        if snapshot is not _SENTINEL:
-            return snapshot
-        if not self._npc_manager or not self._npc_manager.is_running():
-            return None
-        intensity = getattr(self._npc_manager, "_intensity", None)
-        if not intensity:
-            host_map = getattr(self._npc_manager, "_host_intensity", {})
-            vals = list(host_map.values())
-            if vals:
-                intensity = max(set(vals), key=vals.count)
-        return intensity or None
-
     def _primary_database_with_api(self):
         for db_cfg in getattr(self.config, "databases", []):
             if db_cfg.api_port:
@@ -693,22 +474,8 @@ class CaptureManager:
         self,
         session_id: str,
         timing_protocol: Dict,
-        url: Optional[Dict] = None,
     ) -> None:
-        """Append or update a session entry in dataset/schema.json.
-
-        If session_id already exists, merges new url entries into the existing
-        record without creating a duplicate. If not found, creates a new record.
-
-        Args:
-            session_id: unique session identifier.
-            timing_protocol: timing protocol object (src, dest, rhythm, etc.).
-                             enabled/vpn/intensity are omitted — they live in
-                             the experiment object written by auto_gen.py.
-            url: dict of {folder_path: mime_type} entries, e.g.
-                 {"dataset/pcapng": "text/pcapng"}.
-                 Defaults to {cfg.merged: "text/pcapng"}.
-        """
+        """Append or update a session entry in dataset/schema.json."""
         schema_path = self._schema_path()
         os.makedirs(os.path.dirname(schema_path), exist_ok=True)
         records: List[Dict] = []
@@ -722,81 +489,22 @@ class CaptureManager:
             except Exception:
                 records = []
 
-        new_url = url if url is not None else {self.cfg.merged: "text/pcapng"}
-
-        # Upsert: merge url into existing record for this session_id.
         for record in records:
-            if not isinstance(record, dict):
-                continue
-            if record.get("session_id") == session_id:
-                existing_url = record.get("url")
-                if isinstance(existing_url, dict):
-                    existing_url.update(new_url)
-                else:
-                    record["url"] = new_url
+            if isinstance(record, dict) and record.get("session_id") == session_id:
+                record["timing_protocol"] = timing_protocol
+                record.setdefault("pcapng", self._merged_pcapng_path(session_id))
                 _write_schema(records, schema_path)
-                print(
-                    f"[CAPTURE] schema.json updated (session={session_id}).",
-                    flush=True,
-                )
+                print(f"[CAPTURE] schema.json updated (session={session_id}).", flush=True)
                 return
 
-        # New session: create a fresh record.
         records.append({
             "session_id":      session_id,
             "topology":        os.path.basename(self._yaml_path),
-            "url":             new_url,
+            "pcapng":          self._merged_pcapng_path(session_id),
             "timing_protocol": timing_protocol,
         })
         _write_schema(records, schema_path)
         print(f"[CAPTURE] schema.json updated (session={session_id}).", flush=True)
-
-    def _upsert_schema_url(self, session_id: str, url_update: Dict) -> None:
-        """Add url entries to an existing schema record for session_id.
-
-        If no matching record is found, logs a warning — the record must have
-        been created first by _append_schema_record (e.g. at capture stop).
-        """
-        schema_path = self._schema_path()
-        if not os.path.exists(schema_path):
-            print(
-                f"[CAPTURE] Warning: schema.json not found — cannot update URL for "
-                f"session {session_id}.",
-                flush=True,
-            )
-            return
-
-        records: List[Dict] = []
-        try:
-            with open(schema_path, "r", encoding="utf-8") as fh:
-                loaded = json.load(fh)
-            if isinstance(loaded, list):
-                records = loaded
-        except Exception as exc:
-            print(f"[CAPTURE] Warning: could not read schema.json: {exc}", flush=True)
-            return
-
-        for record in records:
-            if isinstance(record, dict) and record.get("session_id") == session_id:
-                existing_url = record.get("url", {})
-                if isinstance(existing_url, dict):
-                    existing_url.update(url_update)
-                    record["url"] = existing_url
-                else:
-                    record["url"] = url_update
-                _write_schema(records, schema_path)
-                print(
-                    f"[CAPTURE] schema.json updated (session={session_id}, "
-                    f"added {list(url_update.keys())}).",
-                    flush=True,
-                )
-                return
-
-        print(
-            f"[CAPTURE] Warning: no schema entry for session {session_id} — "
-            f"URL not updated. Merge must use the exact session_id from 'capture start'.",
-            flush=True,
-        )
 
 
 # -------------------------------------------------------------------- helpers

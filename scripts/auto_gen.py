@@ -98,7 +98,7 @@ _PRE_ACTION_S           = 5    # capture window before exfil/baseline divergence
 _STARTUP_TIMEOUT_S      = 240  # topology boot: VPN + DB deploy can take up to 4 min
 _CMD_TIMEOUT_S          = 120  # typical CLI command completes well under 2 min
 _EXFIL_TIMEOUT_S        = 60   # exfil: curl --max-time 10 + iptables overhead
-_CAPTURE_STOP_TIMEOUT_S = 300  # capture stop: merge + feature selection + CSV pipeline
+_CAPTURE_STOP_TIMEOUT_S = 300  # capture stop: merge + schema pipeline
 _EXIT_TIMEOUT_S         = 90   # topology teardown after exit command
 
 
@@ -110,8 +110,6 @@ class ExperimentConfig:
     topologies: list[str]
     repeat:     int
     vpn:        list[str]
-    npc:        list[str]
-    inject:     list[str]
     exfil:      list[str]
 
     @property
@@ -119,8 +117,6 @@ class ExperimentConfig:
         return (
             len(self.topologies)
             * len(self.vpn)
-            * len(self.npc)
-            * len(self.inject)
             * len(self.exfil)
             * self.repeat
         )
@@ -134,11 +130,16 @@ class Combo:
     progress key. The key is derived automatically from dc_fields() so that
     adding a new YAML dimension requires only adding a field here and including
     it in build_combos() — no manual key editing needed.
+
+    NPC intensity is no longer a global dimension — it is controlled per-device
+    in each topology YAML's npc.hosts section.
+
+    run: 1-indexed repeat counter. Distinguishes repeated experiments when
+    repeat > 1 in auto-gen.yaml, allowing multiple independent captures of the
+    same condition to be identified in schema.json.
     """
     topology: str
     vpn:      str
-    npc:      str
-    inject:   str
     exfil:    str
     run:      int   # 1-indexed within this combo's repeat block
 
@@ -155,8 +156,8 @@ class Combo:
     def pretty(self) -> str:
         topo = Path(self.topology).stem
         return (
-            f"topo={topo:<30} vpn={self.vpn:<4} npc={self.npc:<7} "
-            f"inject={self.inject:<4} exfil={self.exfil:<4} run={self.run}"
+            f"topo={topo:<30} vpn={self.vpn:<4} "
+            f"exfil={self.exfil:<4} run={self.run}"
         )
 
 
@@ -227,8 +228,6 @@ def load_yaml_config(config_path: Path) -> ExperimentConfig:
         topologies=topologies,
         repeat=repeat_raw,
         vpn=_require_str_list(data, "vpn"),
-        npc=_require_str_list(data, "npc"),
-        inject=_require_str_list(data, "inject"),
         exfil=exfil,
     )
 
@@ -284,8 +283,6 @@ def resolve_config(args: argparse.Namespace, yaml_cfg: ExperimentConfig) -> Expe
         topologies=yaml_cfg.topologies,
         repeat=_resolve_repeat(args, yaml_cfg.repeat),
         vpn=yaml_cfg.vpn,
-        npc=yaml_cfg.npc,
-        inject=yaml_cfg.inject,
         exfil=yaml_cfg.exfil,
     )
 
@@ -300,9 +297,8 @@ def print_summary(cfg: ExperimentConfig) -> None:
     print(f"Repeat     : {cfg.repeat}")
     print()
     print(f"VPN        : {'/'.join(cfg.vpn)}")
-    print(f"NPC        : {', '.join(cfg.npc)}")
-    print(f"Inject     : {'/'.join(cfg.inject)}")
     print(f"Exfil      : {'/'.join(cfg.exfil)}")
+    print(f"NPC        : per-device (controlled in topology YAML npc.hosts)")
     print()
     print(f"Total Runs : {cfg.total_runs}")
     print(f"{border}\n")
@@ -314,25 +310,19 @@ def print_summary(cfg: ExperimentConfig) -> None:
 def build_combos(cfg: ExperimentConfig) -> list[Combo]:
     """Generate the full Cartesian product × repeat.
 
-    Every ExperimentConfig list field is a Cartesian dimension. To add a new
-    YAML dimension: add a list[str] field to ExperimentConfig, add a field to
-    Combo, and include it in the product() call below. The key and total_runs
-    update automatically.
+    NPC intensity is not a Cartesian dimension — it is set per-device in
+    each topology YAML's npc.hosts section and applied by 'npc start'.
     """
     combos: list[Combo] = []
     for topo in cfg.topologies:
-        for vpn, npc, inject, exfil, run in product(
+        for vpn, exfil, run in product(
             cfg.vpn,
-            cfg.npc,
-            cfg.inject,
             cfg.exfil,
             range(1, cfg.repeat + 1),
         ):
             combos.append(Combo(
                 topology=topo,
                 vpn=vpn,
-                npc=npc,
-                inject=inject,
                 exfil=exfil,
                 run=run,
             ))
@@ -362,6 +352,18 @@ def save_progress(done: set[str]) -> None:
 
 
 # ──────────────────────────────────────────── Mininet cleanup ─────────────
+
+
+def _topology_has_attacker(topology_rel_path: str) -> bool:
+    """Return True if topology YAML defines exfiltration.attacker."""
+    import yaml  # lazy import — only needed here
+    path = _ROOT / topology_rel_path
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+        return bool((raw or {}).get("exfiltration", {}).get("attacker"))
+    except Exception:
+        return False
 
 
 def _mn_cleanup() -> None:
@@ -397,20 +399,15 @@ def run_experiment(combo: Combo) -> bool:
         mn -c
         spawn: sudo python3 network/topology.py <topology> --cli
         wait for initial "mininet> " prompt (topology fully initialised)
-        manual workflow (verified against ISPCli source):
+        manual workflow:
             vpn on|off
-            apply tc          <- verified: safe no-op if topology has no TC config;
-                                 must precede npc start so TC conditions are active
-                                 for all NPC traffic; blocked after capture start
-            npc start --intensity <level>
-            inject on|off
+            db start           <- generate synthetic data + start API + arm timing
+            npc start          <- per-device intensity from topology YAML npc.hosts
             [sleep _NPC_WARMUP_S]
             capture start
             [sleep _PRE_ACTION_S]
-            exfil on          — TOS-marked HTTP GET to DB (label=1)
-            OR
-            exfil off         — plain HTTP GET to DB     (label=0)
-            capture stop      (triggers merge + CSV pipeline if automatic: true)
+            exfil              — TOS-marked /backup GET to DB (label=1)  [if exfil=on]
+            capture stop       (triggers merge + schema pipeline if automatic: true)
             npc stop
             exit
         wait for EOF (topology process fully terminated)
@@ -442,34 +439,46 @@ def run_experiment(combo: Combo) -> bool:
         # ── 1. VPN ────────────────────────────────────────────────────────────
         _cmd(child, f"vpn {combo.vpn}")
 
-        # ── 2. Traffic Control ────────────────────────────────────────────────
-        _cmd(child, "apply tc")
+        # ── 2. Database — generate synthetic data + start API + arm timing ────
+        _cmd(child, "db start", timeout=30)
 
-        # ── 3. Background NPC traffic ─────────────────────────────────────────
-        _cmd(child, f"npc start --intensity {combo.npc}")
-
-        # ── 4. Timing protocol ────────────────────────────────────────────────
-        _cmd(child, f"inject {combo.inject}")
+        # ── 3. Background NPC traffic (per-device intensity from topology YAML) ─
+        _cmd(child, "npc start")
 
         # NPC warmup: threads prime all links before capture starts
         print(f"\n  [warmup] {_NPC_WARMUP_S}s ...", flush=True)
         time.sleep(_NPC_WARMUP_S)
 
-        # ── 5. Start capture ──────────────────────────────────────────────────
+        # ── 4. Start capture ──────────────────────────────────────────────────
         _cmd(child, "capture start")
 
         # Pre-action window: baseline traffic before exfil/label divergence
         print(f"  [pre-action] {_PRE_ACTION_S}s ...", flush=True)
         time.sleep(_PRE_ACTION_S)
 
-        # ── 6. Exfil on=TOS-marked (label=1), off=plain (label=0) ───────────────
-        _cmd(child, f"exfil {combo.exfil}", timeout=_EXFIL_TIMEOUT_S)
+        # ── 5. Exfil: TOS-marked /backup GET (label=1) or skip (label=0) ─────
+        # Only send exfil when topology defines exfiltration.attacker.
+        if combo.exfil == "on":
+            topo_has_attacker = _topology_has_attacker(combo.topology)
+            if topo_has_attacker:
+                _cmd(child, "exfil", timeout=_EXFIL_TIMEOUT_S)
+                # Let the attacker's FIN propagate through the network and
+                # finalize_session() write the timing JSON before capture stop
+                # reads it. TOS is set at socket-level so FIN also has TOS=0x10;
+                # the sniffer needs a small window to process it.
+                print("  [exfil] waiting 3s for FIN/finalize ...", flush=True)
+                time.sleep(3)
+            else:
+                print(
+                    f"  [exfil] Skipped — {combo.topology} has no exfiltration.attacker",
+                    flush=True,
+                )
 
-        # ── 7. Stop capture — triggers merge + CSV pipeline ───────────────────
-        # capture stop internally calls npc_manager.stop() (capture_manager.py:183)
+        # ── 6. Stop capture — triggers merge + schema pipeline ────────────────
         _cmd(child, "capture stop", timeout=_CAPTURE_STOP_TIMEOUT_S)
 
-        # ── 8. Exit topology ──────────────────────────────────────────────────
+        # ── 7. Stop NPC + exit ────────────────────────────────────────────────
+        _cmd(child, "npc stop")
         print(f"\n>>> exit", flush=True)
         child.sendline("exit")
         child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT_S)
@@ -516,9 +525,11 @@ def _annotate_latest_schema_entry(combo: Combo) -> None:
     Experiments run sequentially (one at a time), so the last entry is always
     the one written by the experiment that just completed.
 
-    Fields written under 'experiment' cover ALL combos — including sessions
-    where timing_protocol is empty (inject=off) which carry no other record
-    of the vpn/npc/inject/exfil settings used.
+    Fields written under 'experiment' cover ALL combos — including baseline
+    sessions where exfil=off (no exfiltration, pure NPC traffic).
+
+    run: distinguishes repeated experiments when repeat > 1 — allows multiple
+    independent captures of the same condition to be correlated in schema.json.
     """
     if not _SCHEMA_FILE.exists():
         print("  WARNING: schema.json not found — combo not annotated.", flush=True)
@@ -532,11 +543,9 @@ def _annotate_latest_schema_entry(combo: Combo) -> None:
         if not isinstance(last, dict):
             return
         last["experiment"] = {
-            "vpn":    combo.vpn,
-            "npc":    combo.npc,
-            "inject": combo.inject,
-            "exfil":  combo.exfil,
-            "run":    combo.run,
+            "vpn":   combo.vpn,
+            "exfil": combo.exfil,
+            "run":   combo.run,
         }
         raw = json.dumps(records, indent=2)
         compacted = re.sub(

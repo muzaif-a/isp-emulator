@@ -8,7 +8,7 @@
 # ── Runtime ───────────────────────────────────────────────────────────────────
 PyYAML>=6.0          # YAML config loading (config_loader.py, auto_gen.py)
 scapy>=2.5.0         # Packet capture, sniffing, PCAP writing (capture_manager.py,
-                     # database_manager.py TOS sniffer, featureapi.py, pcapng_reader.py)
+                     # database_manager.py TOS sniffer, analyze_watermark.py)
 pexpect>=4.8         # PTY-based CLI driver for Mininet subprocess (auto_gen.py)
 
 # ── Testing ───────────────────────────────────────────────────────────────────

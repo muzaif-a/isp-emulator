@@ -8,7 +8,6 @@ Reads config + allocation and constructs the network:
   5. Optionally deploys WireGuard VPN.
   6. [Phase 2] Deploys databases (SQLite + synthetic data + CRUD API).
   7. [Phase 2] Deploys / discovers services.
-  8. [Phase 2] Applies optional firewall rules (with auto-rollback).
 
 Usage
 -----
@@ -20,7 +19,7 @@ Usage
 
     # Enterprise:
     topo = ISPTopology("configs/topology_enterprise.yaml")
-    topo.start(enable_vpn=True, enable_services=True, enable_firewall=True)
+    topo.start(enable_vpn=True, enable_services=True)
 """
 
 import logging
@@ -87,7 +86,6 @@ try:
     from services.service_manager import ServiceManager
     from services.service_registry import ServiceRegistry
     from services.service_discovery import ServiceDiscovery
-    from network.security.firewall_manager import FirewallManager
     _PHASE2_AVAILABLE = True
 except ImportError:
     _PHASE2_AVAILABLE = False
@@ -99,13 +97,14 @@ except ImportError:
     _NPC_AVAILABLE = False
 
 
-def _tos_exfil_script(ip: str, port: int, endpoint: str, tos: int = 0x10) -> str:
+def _tos_exfil_script(ip: str, port: int, tos: int = 0x10,
+                      save_path: str = "/tmp/.app_state.db") -> str:
     """Python script executed inside the attacker's Mininet namespace.
 
-    Sets IP_TOS at the socket level before connect() so only this specific
-    socket carries TOS marking. No host-wide iptables rule is added, so
-    concurrent NPC traffic produces unmarked packets and cannot trigger a
-    spurious timing session.
+    Requests /backup (full SQLite binary dump) with TOS=0x10, saves to
+    save_path.  TOS is set at socket level only — no host-wide iptables rule.
+    The larger binary payload produces more TCP data segments, giving the
+    application-layer watermarker more bits to embed.
     """
     return (
         "import socket, http.client, sys\n"
@@ -115,9 +114,12 @@ def _tos_exfil_script(ip: str, port: int, endpoint: str, tos: int = 0x10) -> str
         f"        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, {tos})\n"
         "        self.sock.settimeout(self.timeout)\n"
         "        self.sock.connect((self.host, self.port))\n"
-        f"c = _TOS('{ip}', {port}, timeout=10)\n"
-        f"c.request('GET', '{endpoint}')\n"
-        "r = c.getresponse(); r.read(); print(r.status)\n"
+        f"c = _TOS('{ip}', {port}, timeout=30)\n"
+        "c.request('GET', '/backup')\n"
+        "r = c.getresponse()\n"
+        "data = r.read()\n"
+        "print(r.status)\n"
+        f"open('{save_path}', 'wb').write(data)\n"
     )
 
 
@@ -152,10 +154,6 @@ class ISPCli(CLI):
         self._exfil_cfg   = exfil_config
         self._allocation  = allocation
         self._config      = config
-        # inject on/off state — tracks current timing protocol state across calls
-        self._inject_active:   bool           = False
-        self._inject_short_ms: Optional[float] = None
-        self._inject_long_ms:  Optional[float] = None
         super().__init__(net, **kwargs)
 
     def do_vpn(self, line: str) -> None:
@@ -176,7 +174,7 @@ class ISPCli(CLI):
             print("Usage: vpn status|on|off|restart")
 
     def do_capture(self, line: str) -> None:
-        """Packet capture: capture start|stop|status|merge|parseToCsv|clean|update"""
+        """Packet capture: capture start|stop|status|merge|clean|update"""
         if not self._cap_mgr:
             print("Capture manager not available")
             return
@@ -187,8 +185,6 @@ class ISPCli(CLI):
             if self._cap_mgr.is_running():
                 print("Capture already running — stop it first")
             else:
-                if not self._cap_mgr._tc_commands:
-                    self._auto_apply_tc(seed=42)
                 self._cap_mgr.start()
         elif cmd == "stop":
             self._cap_mgr.stop()
@@ -201,18 +197,12 @@ class ISPCli(CLI):
                 print("Usage: capture merge <file1> [file2 ...] <session_id>")
                 return
             self._cap_mgr.merge(pcap_files=parts[1:-1], session_id=parts[-1])
-        elif cmd == "parsetocsv":
-            # capture parseToCsv <merged.pcapng>
-            if len(parts) < 2:
-                print("Usage: capture parseToCsv <merged.pcapng>")
-                return
-            self._cap_mgr.parseToCsv(pcap_file=parts[1])
         elif cmd == "clean":
             self._cap_mgr.clean()
         elif cmd == "update":
             self._cap_mgr.update()
         else:
-            print("Usage: capture start|stop|status|merge|parsetocsv|clean|update")
+            print("Usage: capture start|stop|status|merge|clean|update")
 
     def do_npc(self, line: str) -> None:
         """NPC background traffic: npc start [--intensity low|medium|high] | npc stop | npc status"""
@@ -238,119 +228,15 @@ class ISPCli(CLI):
         else:
             print("Usage: npc start [--intensity low|medium|high] | npc stop | npc status")
 
-    def _auto_apply_tc(self, seed: int = 42) -> None:
-        """Auto-apply default TC profile (seed 42) when capture starts with no TC set."""
-        from network.hardware import tc_generator
-        if not self._config:
-            return
-        tc_cfg = getattr(self._config, "traffic_control", None)
-        if not tc_cfg or not tc_cfg.interfaces:
-            return
-        device_classes = getattr(self._config, "device_classes", {})
-        alias_map = {}
-        if self._allocation:
-            alias_map = {v: k for k, v in self._allocation.node_aliases.items()}
-        profile = tc_generator.generate(tc_cfg, device_classes, alias_map, seed=seed)
-        if not profile.commands:
-            return
-        def _prun(node, c: str) -> None:
-            proc = node.popen(c, shell=True)
-            proc.communicate()
-
-        applied = 0
-        for iface, cmd in profile.commands.items():
-            alias = iface.rsplit("-eth", 1)[0]
-            node_name = alias_map.get(alias, alias)
-            try:
-                node = self.mn[node_name]
-                _prun(node, f"tc qdisc del dev {iface} root 2>/dev/null || true")
-                _prun(node, cmd)
-                applied += 1
-            except KeyError:
-                pass
-        print(f"[TC] Auto-applied default TC profile (seed={seed}) to "
-              f"{applied}/{len(profile.commands)} interface(s).", flush=True)
-        if self._cap_mgr:
-            self._cap_mgr.set_tc_profile(profile.commands)
-
-    def do_apply(self, line: str) -> None:
-        """Apply TC netem rules to interfaces from traffic_control config: apply tc [--seed N]"""
-        from network.hardware import tc_generator
-
-        parts = line.split()
-        if not parts or parts[0].lower() != "tc":
-            print("Usage: apply tc [--seed N]")
-            return
-
-        if self._cap_mgr and self._cap_mgr.is_running():
-            print("[TC] Cannot update network profile during active capture session. "
-                  "Run 'capture stop' first.")
-            return
-
-        seed = None
-        if "--seed" in parts:
-            idx = parts.index("--seed")
-            if idx + 1 < len(parts):
-                try:
-                    seed = int(parts[idx + 1])
-                except ValueError:
-                    print("[TC] --seed must be an integer.")
-                    return
-
-        if not self._config:
-            print("[TC] No config available.")
-            return
-
-        tc_cfg = getattr(self._config, "traffic_control", None)
-        if not tc_cfg or not tc_cfg.interfaces:
-            print("[TC] No traffic_control config in YAML — nothing to apply.")
-            return
-
-        device_classes = getattr(self._config, "device_classes", {})
-        alias_map = {}
-        if self._allocation:
-            alias_map = {v: k for k, v in self._allocation.node_aliases.items()}
-
-        profile = tc_generator.generate(tc_cfg, device_classes, alias_map, seed=seed)
-
-        if not profile.commands:
-            print("[TC] No interfaces matched device_classes — nothing applied.")
-            return
-
-        def _prun(node, c: str) -> None:
-            proc = node.popen(c, shell=True)
-            proc.communicate()
-
-        applied = 0
-        for iface, cmd in profile.commands.items():
-            alias = iface.rsplit("-eth", 1)[0]
-            node_name = alias_map.get(alias, alias)
-            try:
-                node = self.mn[node_name]
-                _prun(node, f"tc qdisc del dev {iface} root 2>/dev/null || true")
-                _prun(node, cmd)
-                applied += 1
-            except KeyError:
-                print(f"[TC] Node '{node_name}' (iface={iface}) not in topology — skipped.")
-
-        seed_str = f"  seed={seed}" if seed is not None else ""
-        print(f"[TC] Applied TC rules to {applied}/{len(profile.commands)} interface(s).{seed_str}")
-
-        if self._cap_mgr:
-            self._cap_mgr.set_tc_profile(profile.commands)
-
     def do_exfil(self, line: str) -> None:
-        """HTTP GET to DB — TOS-marked (on) or plain (off).
+        """One-shot TOS-marked HTTP GET to victim DB.
 
         Usage:
-          exfil on            — GET with TOS=0x10  (attack traffic, label=1)
-          exfil off           — GET with TOS=0     (normal traffic, label=0)
-          exfil on --dry-run  — print selection without running
+          exfil           — GET /api/<table> with TOS=0x10 (attack traffic)
+          exfil --dry-run — print selection without running
 
-        Both modes discover attackers + databases from all configs/topology*.yaml
-        files and pick a random attacker + victim + endpoint.
-
-        TOS is scoped to the socket only — no host-wide iptables rule.
+        TOS is set at socket level inside the attacker namespace only.
+        DB TOS sniffer detects FIN/RST and finalizes the watermark session.
         """
         import random
         import time
@@ -359,13 +245,8 @@ class ISPCli(CLI):
 
         tokens = line.split()
         dry_run = "--dry-run" in tokens
-        mode_tokens = [t for t in tokens if t != "--dry-run"]
 
-        if not mode_tokens or mode_tokens[0] not in ("on", "off"):
-            print("[exfil] Usage: exfil on|off [--dry-run]", flush=True)
-            return
-
-        mode = mode_tokens[0]
+        mode = "on"   # always TOS-marked exfiltration
 
         config_dir = Path(__file__).resolve().parent.parent / "configs"
         yaml_files = sorted(config_dir.glob("topology*.yaml"))
@@ -422,9 +303,8 @@ class ISPCli(CLI):
                 time.sleep(10)
                 continue
 
-            # Step 6: Selection — exfil_cfg/cfg_attacker already resolved above
-            cfg_target    = getattr(exfil_cfg, "target_host", None)
-            cfg_endpoints = getattr(exfil_cfg, "endpoints", None) or []
+            # Step 6: Selection
+            cfg_target = getattr(exfil_cfg, "target_host", None)
 
             attacker_name = attackers[0] if len(attackers) == 1 else random.choice(attackers)
             victim = (
@@ -432,21 +312,14 @@ class ISPCli(CLI):
                 if cfg_target else None
             ) or random.choice(filtered_victims)
 
-            # Endpoint: from exfiltration config, else random table
-            if cfg_endpoints:
-                endpoint = random.choice(cfg_endpoints)
-            else:
-                endpoint = f"/api/{random.choice(victim['tables'])}"
-
-            # on=TOS-marked (attack), off=plain (normal)
-            tos = getattr(exfil_cfg, "attack_tos", 0x10) if mode == "on" else 0
+            tos = getattr(exfil_cfg, "attack_tos", 0x10)
 
             port = victim["port"]
             ip   = victim["ip"]
 
             print(
-                f"[exfil] mode={mode}  attacker={attacker_name}  victim={victim['host']}:{port}"
-                f"  endpoint={endpoint}  ip={ip}  tos={hex(tos)}",
+                f"[exfil] attacker={attacker_name}  victim={victim['host']}:{port}"
+                f"  ip={ip}  tos={hex(tos)}  endpoint=/backup",
                 flush=True,
             )
 
@@ -456,118 +329,24 @@ class ISPCli(CLI):
 
             node = self.mn[attacker_name]
 
-            # Step 7: Run GET inside attacker's network namespace.
+            # Step 7: Run /backup GET inside attacker's network namespace.
+            # Saves full SQLite binary to /tmp/.app_state.db on the attacker node.
+            save_path = f"/tmp/.app_state_{attacker_name}.db"
+            print(
+                f"[exfil] Fetching /backup → {save_path}  (TOS={hex(tos)})",
+                flush=True,
+            )
             proc = node.popen(
-                [sys.executable, "-c", _tos_exfil_script(ip, port, endpoint, tos)],
+                [sys.executable, "-c", _tos_exfil_script(ip, port, tos, save_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
             out, _ = proc.communicate()
             result = out.decode().strip() if out else ""
 
-            print(f"[exfil] Done. HTTP status: {result}", flush=True)
+            print(f"[exfil] Done. HTTP status: {result}  saved: {save_path}", flush=True)
             return
 
-    def do_inject(self, line: str) -> None:
-        """Runtime timing protocol toggle for all victim DBs.
-
-        Usage:
-          inject on                              — enable with YAML defaults
-          inject on --short-delay 30 --long-delay 80  — enable with custom delays
-          inject off                             — disable timing protocol
-
-        No-op when called with same state and same params already active.
-        """
-        import shlex
-
-        tokens = shlex.split(line.strip()) if line.strip() else []
-        cmd = tokens[0].lower() if tokens else ""
-
-        if cmd not in ("on", "off"):
-            print("Usage: inject on [--short-delay MS --long-delay MS] | inject off")
-            return
-
-        # YAML defaults from current config (first timing-enabled DB)
-        yaml_short: float = 20.0
-        yaml_long:  float = 50.0
-        if self._config:
-            for db in getattr(self._config, "databases", []):
-                tp = getattr(db, "timing_protocol", None)
-                if tp and getattr(tp, "enabled", False):
-                    yaml_short = float(getattr(tp, "short_delay_ms", 20.0))
-                    yaml_long  = float(getattr(tp, "long_delay_ms",  50.0))
-                    break
-
-        if cmd == "off":
-            target_enabled = False
-            # keep current delays (or YAML defaults if never set)
-            target_short = self._inject_short_ms if self._inject_short_ms is not None else yaml_short
-            target_long  = self._inject_long_ms  if self._inject_long_ms  is not None else yaml_long
-        else:
-            target_enabled = True
-            target_short = yaml_short
-            target_long  = yaml_long
-            i = 1
-            while i < len(tokens):
-                if tokens[i] == "--short-delay" and i + 1 < len(tokens):
-                    target_short = float(tokens[i + 1]); i += 2
-                elif tokens[i] == "--long-delay" and i + 1 < len(tokens):
-                    target_long = float(tokens[i + 1]); i += 2
-                else:
-                    i += 1
-
-        # No-op check: same enabled state AND same delays
-        same = (
-            self._inject_active == target_enabled
-            and self._inject_short_ms is not None
-            and abs(self._inject_short_ms - target_short) < 0.001
-            and self._inject_long_ms  is not None
-            and abs(self._inject_long_ms  - target_long)  < 0.001
-        )
-        if same:
-            state_str = "on" if target_enabled else "off"
-            print(f"[inject] Already {state_str} with same params — no change.", flush=True)
-            return
-
-        # Push to all victim DB APIs running in current net
-        updated = 0
-        if self._config and self._allocation:
-            payload = (
-                f'{{"enabled":{str(target_enabled).lower()},'
-                f'"short_delay_ms":{target_short},'
-                f'"long_delay_ms":{target_long}}}'
-            )
-            for db in getattr(self._config, "databases", []):
-                if not db.api_port or db.host not in self.mn:
-                    continue
-                victim_ip = self._allocation.get_host_ip(db.host)
-                if not victim_ip:
-                    continue
-                node = self.mn[db.host]
-                node.cmd(
-                    f"curl -sf -X POST http://127.0.0.1:{db.api_port}/timing/set "
-                    f"-H 'Content-Type: application/json' "
-                    f"-d '{payload}' -o /dev/null 2>/dev/null || true"
-                )
-                updated += 1
-
-        # Update CLI state
-        self._inject_active   = target_enabled
-        self._inject_short_ms = target_short
-        self._inject_long_ms  = target_long
-
-        if target_enabled:
-            print(
-                f"[inject] ON — short_delay={target_short}ms  long_delay={target_long}ms"
-                f"  ({updated} DB(s) updated)",
-                flush=True,
-            )
-        else:
-            print(
-                f"[inject] OFF — timing disabled  short_delay={target_short}ms"
-                f"  long_delay={target_long}ms  ({updated} DB(s) updated)",
-                flush=True,
-            )
 
 
 class ISPTopology:
@@ -583,7 +362,6 @@ class ISPTopology:
         self.service_registry: Optional["ServiceRegistry"] = None
         self._db_manager: Optional["DatabaseManager"] = None
         self._svc_manager: Optional["ServiceManager"] = None
-        self._fw_manager: Optional["FirewallManager"] = None
         # Phase 3
         self._vpn_controller: Optional[VPNController] = None
         self._capture_manager: Optional[CaptureManager] = None
@@ -596,7 +374,6 @@ class ISPTopology:
         enable_vpn: bool = True,
         enable_cli: bool = False,
         enable_services: bool = True,    # Phase 2
-        enable_firewall: bool = False,   # Phase 2 (default off — config also gates it)
     ) -> None:
         """Build the network, start it, configure routing, deploy VPN + services."""
         import traceback as _tb
@@ -632,20 +409,6 @@ class ISPTopology:
             raise
         print_allocation(self.allocation)
         print_iface_aliases(self.allocation)
-
-        # ── Validate TC interface names against allocation aliases ───────────
-        tc_cfg = getattr(self.config, "traffic_control", None)
-        if tc_cfg and tc_cfg.interfaces:
-            all_aliases = set(self.allocation.node_aliases.values())
-            all_nodes   = {n.name for n in self.config.nodes}
-            known = all_aliases | all_nodes
-            for iface in tc_cfg.interfaces:
-                node_part = iface.rsplit("-eth", 1)[0]
-                if node_part not in known:
-                    print(f"[WARN] traffic_control.{iface!r}: "
-                          f"node {node_part!r} not found in topology — "
-                          f"interface will be skipped. Check spelling or add to nodes:",
-                          flush=True)
 
         # ── STEP 3: build Mininet object ────────────────────────────────────
         print("[DBG-3] Building Mininet topology …", flush=True)
@@ -730,7 +493,7 @@ class ISPTopology:
         if enable_services and _PHASE2_AVAILABLE:
             print("[DBG-9] Phase 2 deployment …", flush=True)
             try:
-                self._deploy_phase2(enable_firewall=enable_firewall)
+                self._deploy_phase2()
                 print("[DBG-9] Phase 2 done", flush=True)
             except Exception:
                 print("[DBG-9] EXCEPTION in Phase 2 (non-fatal):", flush=True)
@@ -872,52 +635,6 @@ class ISPTopology:
             proc.communicate()
             return True
 
-    def apply_tc(self, seed: int = None) -> bool:
-        """Apply TC (TBF+netem) rules to all configured interfaces.
-
-        Args:
-            seed: random seed for reproducible profiles; None = random per call.
-
-        Returns True if at least one interface was configured.
-        """
-        from network.hardware import tc_generator
-
-        if not self.config or not self.net:
-            return False
-
-        tc_cfg = getattr(self.config, "traffic_control", None)
-        if not tc_cfg or not tc_cfg.interfaces:
-            return False
-
-        device_classes = getattr(self.config, "device_classes", {})
-        alias_map = {}
-        if self.allocation:
-            alias_map = {v: k for k, v in self.allocation.node_aliases.items()}
-
-        profile = tc_generator.generate(tc_cfg, device_classes, alias_map, seed=seed)
-        if not profile.commands:
-            return False
-
-        applied = 0
-        for iface, cmd in profile.commands.items():
-            alias = iface.rsplit("-eth", 1)[0]
-            node_name = alias_map.get(alias, alias)
-            try:
-                node = self.net[node_name]
-                node.cmd(f"tc qdisc del dev {iface} root 2>/dev/null || true")
-                node.cmd(cmd)
-                applied += 1
-            except KeyError:
-                pass
-
-        if self._capture_manager:
-            self._capture_manager.set_tc_profile(profile.commands)
-
-        seed_str = f" seed={seed}" if seed is not None else " (random)"
-        print(f"[TC] Applied to {applied}/{len(profile.commands)} interface(s).{seed_str}",
-              flush=True)
-        return applied > 0
-
     def stop(self) -> None:
         """Tear down the Mininet network and finalise captures."""
         if self._svc_manager:
@@ -930,11 +647,10 @@ class ISPTopology:
                 self._npc_manager.stop()
             except Exception:
                 pass
-        # Stop captures, merge pcaps, export CSV — respect YAML config flags
+        # Stop captures, merge pcaps — respect YAML config flags
         if self._capture_manager:
             try:
                 self._capture_manager.stop()
-                self._capture_manager.teardown_tc()   # clean TC on exit
                 self._capture_manager.status()
             except Exception as exc:
                 logger.warning("Capture finalisation error: %s", exc)
@@ -972,8 +688,8 @@ class ISPTopology:
 
     # -------------------------------------------------------- Phase 2 deployment
 
-    def _deploy_phase2(self, enable_firewall: bool = False) -> None:
-        """Deploy databases, services, and optional firewall."""
+    def _deploy_phase2(self) -> None:
+        """Deploy databases and services."""
         self.service_registry = ServiceRegistry()
 
         # Databases
@@ -1005,17 +721,6 @@ class ISPTopology:
 
             self.service_registry.print_table()
 
-        # Firewall (optional)
-        if enable_firewall and self.config.security.firewall.enabled:
-            logger.info("[Phase 2] Applying firewall rules …")
-            self._fw_manager = FirewallManager(
-                self.net, self.config, self.allocation, self.service_registry
-            )
-            try:
-                self._fw_manager.apply()
-            except Exception as exc:
-                logger.error("Firewall failed (rolled back): %s", exc)
-
     # --------------------------------------------------------------- network build
 
     def _build_network(self) -> Mininet:
@@ -1033,7 +738,6 @@ class ISPTopology:
         net = Mininet(
             controller=_NullController,   # no-op placeholder, no binary needed
             switch=OVSSwitch,
-            link=TCLink,
             autoSetMacs=True,
             autoStaticArp=False,
         )
@@ -1069,12 +773,20 @@ class ISPTopology:
         # Add links in config order (preserves eth interface indices)
         for link in self.config.links:
             a, b = link[0], link[1]
-            # Use pre-computed short interface names (respects IFNAMSIZ ≤ 15)
             iface_a = self.allocation.get_iface_for_link(a, b)
             iface_b = self.allocation.get_iface_for_link(b, a)
+            tc = (self.config.link_tc.get((a, b))
+                  or self.config.link_tc.get((b, a)))
             try:
-                net.addLink(net[a], net[b], intfName1=iface_a, intfName2=iface_b)
-                print(f"[DBG-BN] + link  {a}({iface_a}) <-> {b}({iface_b})", flush=True)
+                if tc:
+                    params = tc.to_mininet()
+                    net.addLink(net[a], net[b], intfName1=iface_a, intfName2=iface_b,
+                                cls=TCLink, params1=params, params2=params)
+                    print(f"[DBG-BN] + link  {a}({iface_a}) <-> {b}({iface_b})"
+                          f"  bw={tc.bw}M delay={tc.delay}", flush=True)
+                else:
+                    net.addLink(net[a], net[b], intfName1=iface_a, intfName2=iface_b)
+                    print(f"[DBG-BN] + link  {a}({iface_a}) <-> {b}({iface_b})", flush=True)
             except Exception:
                 print(f"[DBG-BN] EXCEPTION adding link {a}({iface_a})<->{b}({iface_b}):", flush=True)
                 _tb.print_exc()

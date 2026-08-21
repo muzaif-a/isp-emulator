@@ -1,26 +1,18 @@
 selected:
-  # - configs/topology_dmz_segmented.yaml
-  - configs/topology_enterprise.yaml
-  # - configs/topology_insider_threat.yaml
-  # - configs/topology_remote_worker.yaml
-  # - configs/topology_three_site.yaml
-  # - configs/topology_wan_isp.yaml
+  - configs/topology_enterprise.yaml       # attacker h2, office LAN, vpnhub
+  # - configs/topology_insider_threat.yaml # attacker inside corporate LAN
+  # - configs/topology_remote_worker.yaml  # attacker behind home router (remote_access VPN)
+  # - configs/topology_three_site.yaml     # 3 corporate sites, site-to-site VPN
+  # - configs/topology_dmz_segmented.yaml  # no exfiltration.attacker — exfil auto-skipped
+  # - configs/topology_wan_isp.yaml        # no exfiltration.attacker — exfil auto-skipped
   # - configs/topology.yaml
-repeat: 1
+
+repeat: 1   # runs per combo — different synthetic data each run (random row values)
 
 vpn:
-  - on
-  # - off
-
-npc:
-  # - low
-  - medium
-  # - high
-
-inject:
-  - on
-  # - off
+  - on    # WireGuard tunnel active — watermark traverses encrypted VPN
+  # - off   # direct path — no VPN overhead
 
 exfil:
-  # - on
-  - off
+  - on    # TOS-marked /backup GET → application-layer watermark → label=1
+  # - off   # baseline NPC-only capture, no exfil → label=0
